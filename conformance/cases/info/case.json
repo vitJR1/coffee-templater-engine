@@ -1,0 +1,12 @@
+{
+  "description": "info reports versions, formats and capabilities",
+  "op": "info",
+  "expect": {
+    "result": [
+      { "path": "abiVersion", "equals": 1 },
+      { "path": "modelVersion", "equals": 1 },
+      { "path": "formats", "equals": ["docx", "xlsx", "pptx"] },
+      { "path": "features", "equals": { "images": ["docx", "pptx"], "slideLoops": false, "hostFilters": true } }
+    ]
+  }
+}

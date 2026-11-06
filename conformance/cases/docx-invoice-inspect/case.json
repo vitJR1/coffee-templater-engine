@@ -1,0 +1,13 @@
+{
+  "description": "inspect: tag tree, variable paths and sample data shape",
+  "op": "inspect",
+  "template": "fixtures/invoice.docx",
+  "expect": {
+    "result": [
+      { "path": "format", "equals": "docx" },
+      { "path": "variables", "equals": ["number", "client.name", "items[].name", "items[].price", "items[].qty", "paid", "notes", "logo", "total", "company"] },
+      { "path": "schema", "equals": { "client": { "name": "" }, "items": [{ "name": "", "price": "", "qty": "" }], "paid": true, "logo": null } },
+      { "path": "parts[0].tags[2]", "equals": { "type": "section", "mode": "section", "path": "items", "raw": "{{#items}}" } }
+    ]
+  }
+}

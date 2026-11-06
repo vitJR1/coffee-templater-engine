@@ -1,0 +1,14 @@
+{
+  "description": "an empty loop removes its rows and shifts the rows below up",
+  "op": "render",
+  "template": "fixtures/report.xlsx",
+  "data": { "title": 2024, "items": [], "author": true },
+  "expect": {
+    "model": [
+      { "path": "sheets[0].rows[0].cells[0].value", "equals": "Report: 2024" },
+      { "path": "sheets[0].rows[2].cells[0]", "equals": { "ref": "A4", "value": "Total" } },
+      { "path": "sheets[0].rows[2].cells[1]", "equals": { "ref": "D4", "formula": "SUM(D3:D3)" } },
+      { "path": "sheets[1].rows[0].cells[1].value", "equals": true }
+    ]
+  }
+}

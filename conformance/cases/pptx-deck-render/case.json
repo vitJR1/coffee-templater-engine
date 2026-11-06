@@ -1,0 +1,45 @@
+{
+  "description": "slides: text, line breaks, paragraph loops, table rows, picture in a text box, notes",
+  "op": "render",
+  "template": "fixtures/deck.pptx",
+  "data": {
+    "title": "Hello",
+    "subtitle": "line 1\nline 2",
+    "points": [
+      "a",
+      "b",
+      "c"
+    ],
+    "logo": {
+      "data": {
+        "$base64": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGP4z8DwnwEIGBgAHvAD/c5k+8YAAAAASUVORK5CYII="
+      }
+    },
+    "rows": [
+      {
+        "name": "x",
+        "value": 1
+      },
+      {
+        "name": "y",
+        "value": 2
+      }
+    ],
+    "speaker": "Bob"
+  },
+  "expect": {
+    "text": "--- Slide 1 ---\nHello\nline 1\nline 2\n\n--- Slide 2 ---\n• a\n• b\n• c\nName\tValue\nx\t1\ny\t2\nNotes: Speaker: Bob",
+    "parts": {
+      "ppt/slides/slide2.xml": {
+        "contains": [
+          "<p:pic>",
+          "<a:off x=\"5486400\" y=\"1143000\"/><a:ext cx=\"2743200\" cy=\"1371600\"/>"
+        ],
+        "notContains": [
+          "{{%logo}}"
+        ]
+      }
+    },
+    "sha256": "2f7ff87031eb3ee29f2f8080fb8f4db6fed7fb60379706a0199845a9cc0a2cbe"
+  }
+}

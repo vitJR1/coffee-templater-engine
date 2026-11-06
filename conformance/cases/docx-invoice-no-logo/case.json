@@ -1,0 +1,50 @@
+{
+  "description": "an empty image value removes the image tag; typed data values ($decimal, $date)",
+  "op": "render",
+  "template": "fixtures/invoice.docx",
+  "data": {
+    "company": "ACME",
+    "number": {
+      "$decimal": "1000000000000000000001"
+    },
+    "client": {
+      "name": "Ann"
+    },
+    "items": [
+      {
+        "name": "Beans",
+        "qty": 1,
+        "price": {
+          "$decimal": "1234.505"
+        }
+      }
+    ],
+    "paid": false,
+    "notes": {
+      "$date": "2024-05-17"
+    },
+    "logo": null,
+    "total": 1
+  },
+  "expect": {
+    "textContains": [
+      "Invoice 1000000000000000000001",
+      "- Beans: 1 234,51",
+      "Status: not paid",
+      "Notes: 2024-05-17"
+    ],
+    "parts": {
+      "word/document.xml": {
+        "notContains": [
+          "<w:drawing>"
+        ]
+      }
+    },
+    "files": {
+      "notContains": [
+        "word/media/image_ct1.png"
+      ]
+    },
+    "sha256": "a4f4070bd236a432f6193be0d6c30bcbe1411e20ce58bbb23250337f1390da67"
+  }
+}

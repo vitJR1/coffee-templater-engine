@@ -1,0 +1,20 @@
+[package]
+name = "coffee-core"
+description = "Templating engine and document model for DOCX/XLSX/PPTX (pure, no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+miniz_oxide.workspace = true
+crc32fast.workspace = true
+base64.workspace = true
+regex-lite.workspace = true
+schemars = { version = "1", optional = true }
+
+[features]
+# JSON Schema of the model, limits and errors (schema/*.json)
+schema = ["dep:schemars"]

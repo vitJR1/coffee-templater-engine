@@ -1,0 +1,8 @@
+{
+  "description": "with other delimiters the {{...}} text is left alone",
+  "op": "render",
+  "template": "fixtures/invoice.docx",
+  "options": { "delimiters": { "start": "[[", "end": "]]" } },
+  "data": { "number": 1 },
+  "expect": { "textContains": ["Invoice {{number}}", "Escaped: \\{{literal}}"] }
+}

@@ -1,0 +1,13 @@
+{
+  "company": "ACME",
+  "number": 42,
+  "client": { "name": "Иван" },
+  "items": [
+    { "name": "Coffee", "qty": 2, "price": 10.5 },
+    { "name": "Tea", "qty": 1, "price": 4 }
+  ],
+  "paid": true,
+  "notes": "line 1\nline 2",
+  "logo": { "data": { "$blob": 0 }, "width": 120 },
+  "total": 25
+}

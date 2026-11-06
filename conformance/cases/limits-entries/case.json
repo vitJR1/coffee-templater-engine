@@ -1,0 +1,7 @@
+{
+  "description": "zip limits are enforced before inflating",
+  "op": "parse",
+  "template": "fixtures/invoice.docx",
+  "limits": { "maxEntries": 3 },
+  "expect": { "errors": [{ "code": "limit_exceeded", "details": { "limit": "maxEntries" } }] }
+}

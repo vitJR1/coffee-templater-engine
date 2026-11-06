@@ -1,0 +1,8 @@
+{
+  "description": "strict mode reports missing values",
+  "op": "render",
+  "template": "fixtures/invoice.docx",
+  "options": { "strict": true },
+  "data": {},
+  "expect": { "errors": [{ "code": "missing_value", "tag": "{{number}}" }] }
+}

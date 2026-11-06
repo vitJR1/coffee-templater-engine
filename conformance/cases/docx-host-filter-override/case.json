@@ -1,0 +1,8 @@
+{
+  "description": "a host filter overrides the built-in filter with the same name and receives arguments",
+  "op": "render",
+  "template": "fixtures/invoice.docx",
+  "hostFilters": { "number": { "type": "format", "pattern": "<{value}|{arg0}>" }, "upper": { "type": "upper" } },
+  "data": { "number": 7, "client": { "name": "Ann" }, "items": [{ "name": "Coffee", "qty": 2, "price": 10.5 }], "logo": null },
+  "expect": { "textContains": ["Invoice 7", "- Coffee: <10.5|2>"] }
+}

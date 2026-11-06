@@ -1,0 +1,41 @@
+{
+  "description": "variables, split runs, paragraph and row loops, if/else, escaping, line breaks, image, header, currency",
+  "op": "render",
+  "template": "fixtures/invoice.docx",
+  "expect": {
+    "textContains": [
+      "Invoice 42",
+      "Client: Иван",
+      "- Coffee: 10,50\n- Tea: 4,00",
+      "Coffee\t2\t10.5",
+      "Status: paid",
+      "Escaped: {{literal}}",
+      "Notes: line 1\nline 2",
+      "Total: 25,00 €"
+    ],
+    "parts": {
+      "word/document.xml": {
+        "contains": [
+          "<w:drawing>",
+          "<w:br/>",
+          "cx=\"1143000\" cy=\"571500\""
+        ],
+        "notContains": [
+          "{{#",
+          "{{number"
+        ]
+      },
+      "word/header1.xml": {
+        "contains": [
+          "ACME — confidential"
+        ]
+      }
+    },
+    "files": {
+      "contains": [
+        "word/media/image_ct1.png"
+      ]
+    },
+    "sha256": "80723a0871c2f50f9e6fa6b3e19c2ca03578820554cc230aefe76a5fa67b89b9"
+  }
+}

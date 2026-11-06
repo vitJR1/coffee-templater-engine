@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Error",
+  "type": "object",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/ErrorCode"
+    },
+    "message": {
+      "type": "string"
+    },
+    "part": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tag": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "location": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Location"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "details": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "code",
+    "message",
+    "details"
+  ],
+  "$defs": {
+    "ErrorCode": {
+      "description": "Error codes. Template codes match the TS implementation; the rest are core-level codes.",
+      "type": "string",
+      "enum": [
+        "unclosed_tag",
+        "unopened_tag",
+        "unclosed_section",
+        "unmatched_close",
+        "invalid_expression",
+        "unknown_filter",
+        "filter_failed",
+        "missing_value",
+        "invalid_section",
+        "invalid_image",
+        "unsupported",
+        "invalid_request",
+        "invalid_options",
+        "invalid_document",
+        "unsupported_format",
+        "invalid_model",
+        "unknown_template",
+        "limit_exceeded",
+        "host_error",
+        "internal"
+      ]
+    },
+    "Location": {
+      "description": "Where an error happened inside a part. Filled when known.",
+      "type": "object",
+      "properties": {
+        "paragraph": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cell": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slide": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "row": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

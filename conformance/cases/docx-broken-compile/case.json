@@ -1,0 +1,11 @@
+{
+  "description": "compile reports all template errors, across parts",
+  "op": "compile",
+  "template": "fixtures/broken.docx",
+  "expect": {
+    "errors": [
+      { "code": "unclosed_section", "tag": "{{#items}}", "part": "word/document.xml" },
+      { "code": "unknown_filter", "tag": "{{company | nope}}" }
+    ]
+  }
+}

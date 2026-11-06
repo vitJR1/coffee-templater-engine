@@ -1,0 +1,13 @@
+[package]
+name = "coffee-wasm"
+description = "coffee_core.wasm: WebAssembly build of coffee-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "coffee_core_wasm"
+crate-type = ["cdylib"]
+
+[dependencies]
+coffee-abi.workspace = true

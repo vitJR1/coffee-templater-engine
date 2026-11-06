@@ -1,0 +1,8 @@
+{
+  "description": "a failing host filter becomes filter_failed with the host message",
+  "op": "render",
+  "template": "fixtures/invoice.docx",
+  "hostFilters": { "number": { "type": "throw", "message": "unsupported currency" } },
+  "data": { "items": [{ "name": "Coffee", "price": 1 }] },
+  "expect": { "errors": [{ "code": "filter_failed", "tag": "{{price | number: 2}}", "part": "word/document.xml", "details": { "hostMessage": "unsupported currency" } }] }
+}

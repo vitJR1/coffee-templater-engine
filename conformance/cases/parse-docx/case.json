@@ -1,0 +1,13 @@
+{
+  "description": "parse: paragraphs, styles, split runs with formatting, tables",
+  "op": "parse",
+  "template": "fixtures/invoice.docx",
+  "expect": {
+    "model": [
+      { "path": "format", "equals": "docx" },
+      { "path": "modelVersion", "equals": 1 },
+      { "path": "parts[0].blocks[0]", "equals": { "type": "paragraph", "style": "Heading1", "children": [{ "type": "run", "text": "Invoice {{number}}" }] } },
+      { "path": "parts[0].blocks[1].children[1]", "equals": { "type": "run", "text": "{{cli", "bold": true } }
+    ]
+  }
+}

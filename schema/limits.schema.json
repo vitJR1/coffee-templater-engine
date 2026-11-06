@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Limits",
+  "type": "object",
+  "properties": {
+    "maxInputBytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 104857600
+    },
+    "maxEntries": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 10000
+    },
+    "maxUncompressedBytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 524288000
+    },
+    "maxCompressionRatio": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 200
+    },
+    "maxXmlDepth": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 256
+    },
+    "maxOutputBytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 524288000
+    },
+    "maxLoopIterations": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 1000000
+    },
+    "maxHostCalls": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 1000000
+    }
+  }
+}

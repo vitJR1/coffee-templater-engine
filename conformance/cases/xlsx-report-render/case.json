@@ -1,0 +1,90 @@
+{
+  "description": "row loops keep types, shift rows, formulas and merges",
+  "op": "render",
+  "template": "fixtures/report.xlsx",
+  "data": {
+    "title": "Q1",
+    "items": [
+      {
+        "name": "Coffee",
+        "qty": 2,
+        "price": 10.5
+      },
+      {
+        "name": "Tea",
+        "qty": 1,
+        "price": 4
+      },
+      {
+        "name": "Milk",
+        "qty": 3,
+        "price": 1.25
+      }
+    ],
+    "author": "me"
+  },
+  "expect": {
+    "model": [
+      {
+        "path": "sheets[0].rows[0].cells[0]",
+        "equals": {
+          "ref": "A1",
+          "value": "Report: Q1"
+        }
+      },
+      {
+        "path": "sheets[0].rows[2].cells",
+        "equals": [
+          {
+            "ref": "A3",
+            "value": "Coffee"
+          },
+          {
+            "ref": "B3",
+            "value": 2
+          },
+          {
+            "ref": "C3",
+            "value": 10.5
+          },
+          {
+            "ref": "D3",
+            "formula": "B3*C3"
+          },
+          {
+            "ref": "E3",
+            "value": ""
+          }
+        ]
+      },
+      {
+        "path": "sheets[0].rows[5].cells[1]",
+        "equals": {
+          "ref": "D7",
+          "formula": "SUM(D3:D5)"
+        }
+      },
+      {
+        "path": "sheets[0].merges",
+        "equals": [
+          "A1:D1"
+        ]
+      },
+      {
+        "path": "sheets[1].rows[0].cells[1]",
+        "equals": {
+          "ref": "B1",
+          "value": "me"
+        }
+      }
+    ],
+    "parts": {
+      "xl/workbook.xml": {
+        "contains": [
+          "fullCalcOnLoad=\"1\""
+        ]
+      }
+    },
+    "sha256": "edf139617385a57917996cb9fc2d2318f03d876201ffeae28305ed2a59ee3ed7"
+  }
+}

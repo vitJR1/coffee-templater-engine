@@ -1,0 +1,13 @@
+[package]
+name = "coffee-capi"
+description = "C ABI of coffee-core for native builds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "coffee_core_capi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+coffee-abi.workspace = true

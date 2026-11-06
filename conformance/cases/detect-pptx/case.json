@@ -1,0 +1,6 @@
+{
+  "description": "detect",
+  "op": "detect",
+  "template": "fixtures/deck.pptx",
+  "expect": { "result": [{ "path": "format", "equals": "pptx" }] }
+}

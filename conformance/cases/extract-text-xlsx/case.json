@@ -1,0 +1,8 @@
+{
+  "description": "extractText: tab-separated cells per sheet (formula cells without a cached value are empty)",
+  "op": "extractText",
+  "template": "fixtures/report.xlsx",
+  "expect": {
+    "text": "Report\nReport: {{title}}\t\t\t\t\nName\tQty\tPrice\tSum\t\n{{#items}}{{name}}\t{{qty}}\t{{price}}\t\t{{/items}}\n\t\t\t\t\nTotal\t\t\t\t\nEscaped \\{{x}}\t\t\t\t\n\nInfo\nAuthor\t{{author}}"
+  }
+}
