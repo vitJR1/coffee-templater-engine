@@ -1,7 +1,7 @@
 name: package
 
-# Builds the distributable package on every push to main.
-# Tags v* additionally publish a GitHub Release with the same files.
+# Builds the distributable package on every push to main and publishes it as the rolling
+# "nightly" pre-release. Tags v* publish a versioned GitHub Release with the same files.
 on:
   push:
     branches: [main]
@@ -90,16 +90,32 @@ jobs:
             pkg/*.zip
 
   release:
-    name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: GitHub Release (${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'nightly' }})
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [wasm, native]
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+      # push to main: rolling pre-release "nightly", recreated on the current commit
+      - name: Publish nightly
+        if: github.ref == 'refs/heads/main'
+        run: |
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Nightly (${GITHUB_SHA::7})" \
+            --notes "Built from ${GITHUB_SHA} on main. Not a stable release: use a v* release for production."
+      # tag v*: versioned release
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

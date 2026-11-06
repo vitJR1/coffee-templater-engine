@@ -119,8 +119,8 @@ cargo run -p coffee-core --release --example bench -- 10000   # render benchmark
 
 Every push to `main` builds the package in GitHub Actions (`package` workflow):
 `coffee_core.wasm` with the JSON schemas, plus C ABI libraries and the header for Linux, macOS and
-Windows. They are attached as workflow artifacts. Pushing a `v*` tag also publishes them as a
-GitHub Release.
+Windows. They are published as the rolling `nightly` pre-release. Pushing a `v*` tag publishes a versioned
+GitHub Release with the same files.
 
 ## Writing a wrapper
 
