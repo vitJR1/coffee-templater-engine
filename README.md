@@ -102,7 +102,7 @@ docs/            design specification (Russian)
 
 ## Building
 
-Requires Rust ≥ 1.87 with the `wasm32-unknown-unknown` target, and Node.js ≥ 18 for the WebAssembly
+Requires Rust ≥ 1.87 with the `wasm32-unknown-unknown` target, and Node.js ≥ 22 (see `.nvmrc`) for the WebAssembly
 conformance run.
 
 ```sh
