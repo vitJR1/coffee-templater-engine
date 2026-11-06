@@ -129,6 +129,7 @@ pub fn write<'a>(entries: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Resu
     let mut central: Vec<u8> = Vec::new();
     let mut count: usize = 0;
     for (name, data) in entries {
+        check_name(name)?;
         let crc = crc32fast::hash(data);
         let deflated = miniz_oxide::deflate::compress_to_vec(data, DEFLATE_LEVEL);
         let (method, body): (u16, &[u8]) = if deflated.len() < data.len() { (8, &deflated) } else { (0, data) };
@@ -201,7 +202,15 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_and_limits() {
-        let z = write(vec![("../evil", b"x".as_slice())]).unwrap();
+        assert!(write(vec![("../evil", b"x".as_slice())]).is_err());
+        assert!(write(vec![("word/media/x.png/../../evil", b"x".as_slice())]).is_err());
+        // a crafted archive: same name length, patched to "../evil" in both headers
+        let mut z = write(vec![("aa/evil", b"x".as_slice())]).unwrap();
+        for i in 0..z.len() - 3 {
+            if &z[i..i + 3] == b"aa/" {
+                z[i..i + 3].copy_from_slice(b"../");
+            }
+        }
         assert!(read(&z, &Limits::default()).is_err());
         let z = write(vec![("a", b"x".as_slice()), ("b", b"y".as_slice())]).unwrap();
         let limits = Limits { max_entries: 1, ..Limits::default() };

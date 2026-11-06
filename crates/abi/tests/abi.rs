@@ -230,3 +230,15 @@ fn host_call_limit() {
     assert_eq!(r["errors"][0]["code"], "limit_exceeded");
     assert_eq!(r["errors"][0]["details"]["limit"], "maxHostCalls");
 }
+
+#[test]
+fn panics_become_internal_errors() {
+    let mut inst = Instance::new(Box::new(|_: &[u8]| -> Option<Vec<u8>> { panic!("host transport bug") }));
+    let tpl = docx_with("{{x | money}}");
+    let (r, _) = call(&mut inst, json!({"op": "renderOnce", "template": {"$blob": 0}, "options": {"hostFilters": ["money"]}}), vec![tpl]);
+    assert_eq!(r["errors"][0]["code"], "internal");
+    assert!(r["errors"][0]["message"].as_str().unwrap().contains("host transport bug"));
+    // the instance keeps working
+    let (r, _) = call(&mut inst, json!({"op": "info"}), vec![]);
+    assert_eq!(r["ok"], true);
+}

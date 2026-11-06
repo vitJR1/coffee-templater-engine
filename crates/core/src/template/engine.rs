@@ -9,7 +9,7 @@ use super::tags::{closes, parse_tag, ExprTag, OpenTag, ParsedTag, SectionMode};
 use crate::error::{Error, ErrorCode, Result};
 use crate::host::{Host, HostError, TagInfo};
 use crate::image::{is_image_value, resolve_image, ResolvedImage};
-use crate::limits::exceeds;
+use crate::limits::{exceeds, xml_depth, MAX_SECTION_DEPTH};
 use crate::opc::Package;
 use crate::value::Value;
 use crate::xml::escape::{decode_xml, escape_xml};
@@ -261,8 +261,8 @@ fn compute_structure(tokens: &[Tok], part: &str, max_depth: u64) -> Result<(Hash
         match t {
             Tok::Xml { kind: XmlKind::Open, .. } => {
                 stack.push(i);
-                if exceeds(stack.len() as u64, max_depth) {
-                    return Err(Error::limit("maxXmlDepth", max_depth).with_part(part));
+                if exceeds(stack.len() as u64, xml_depth(max_depth)) {
+                    return Err(Error::limit("maxXmlDepth", xml_depth(max_depth)).with_part(part));
                 }
             }
             Tok::Xml { kind: XmlKind::Close, name, .. } => {
@@ -332,7 +332,12 @@ fn compute_ranges(
     for (i, t) in tokens.iter().enumerate() {
         let Tok::Tag(tag) = t else { continue };
         match tag {
-            ParsedTag::Open(_) => open.push((i, None)),
+            ParsedTag::Open(t) => {
+                open.push((i, None));
+                if open.len() > MAX_SECTION_DEPTH {
+                    return Err(vec![Error::limit("sectionDepth", MAX_SECTION_DEPTH as u64).with_part(part).with_tag(&t.raw)]);
+                }
+            }
             ParsedTag::Else { raw } => match open.last_mut() {
                 None => errors.push(err(ErrorCode::UnmatchedClose, "\"else\" outside of a section", raw.clone())),
                 Some((_, Some(_))) => errors.push(err(ErrorCode::InvalidSection, "Duplicate \"else\"", raw.clone())),

@@ -150,15 +150,56 @@ pub fn preprocess(pkg: &Package, part: &str, xml: &str, state: &mut XlsxState, d
     xml.into_owned()
 }
 
-pub fn postprocess(xml: &str, part: &str, state: &XlsxState) -> String {
+/// Resolves typed scalars and renumbers rows. Returns the row map when rows moved; `finalize`
+/// uses it to update references to this sheet from tables, defined names and other sheets.
+pub fn postprocess(xml: &str, part: &str, state: &XlsxState) -> (String, Option<RowMap>) {
     let xml = resolve_scalar_markers(xml);
     let empty = BTreeSet::new();
     renumber_rows(&xml, state.template_rows.get(part).unwrap_or(&empty))
 }
 
-pub fn finalize(pkg: &mut Package) {
-    // Cached calculation order is invalid after rows move: drop it and ask Excel to recalculate.
+const REL_TABLE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
+
+/// Updates what lives outside the rendered sheets (`maps`: sheet part → row map), then drops the
+/// calculation chain.
+pub fn finalize(pkg: &mut Package, maps: &[(String, RowMap)]) {
     let wb = workbook_path(pkg);
+    if !maps.is_empty() {
+        let sheets = worksheet_parts(pkg);
+        let named: Vec<(&str, &RowMap)> =
+            sheets.iter().filter_map(|s| maps.iter().find(|(p, _)| *p == s.path).map(|(_, m)| (s.name.as_str(), m))).collect();
+        // references to rendered sheets from any sheet (`Sheet1!A5`, `'My sheet'!A5`)
+        for s in &sheets {
+            let Some(xml) = pkg.get_text(&s.path) else { continue };
+            let next = rewrite_elements(&xml, "<f", "</f>", None, &|f| map_qualified(f, &named));
+            if next != xml {
+                pkg.set_text(&s.path, &next);
+            }
+        }
+        // defined names (print areas, named ranges)
+        if let Some(xml) = pkg.get_text(&wb) {
+            let next = rewrite_elements(&xml, "<definedName", "</definedName>", None, &|f| map_qualified(f, &named));
+            if next != xml {
+                pkg.set_text(&wb, &next);
+            }
+        }
+        // tables on rendered sheets
+        for (part, map) in maps {
+            for (_, table) in pkg.related_parts(part, REL_TABLE) {
+                let Some(xml) = pkg.get_text(&table) else { continue };
+                let next = rewrite_ref_attrs(&xml, &["<table", "<autoFilter"], map);
+                if next != xml {
+                    pkg.set_text(&table, &next);
+                }
+            }
+        }
+    }
+    finalize_calc(pkg, &wb);
+}
+
+/// Cached calculation order is invalid after rows move: drop it and ask Excel to recalculate.
+fn finalize_calc(pkg: &mut Package, wb: &str) {
+    let wb = wb.to_string();
     for (_, path) in pkg.related_parts(&wb, rel::CALC_CHAIN) {
         pkg.remove(&path);
         pkg.remove_override(&path);
@@ -182,22 +223,194 @@ pub fn finalize(pkg: &mut Package) {
     pkg.set_text(&wb, &next);
 }
 
-/// Turns cells that consist of a single numeric/boolean value into real typed cells.
+// ------------------------------------------------------------------------------------------
+// Scanning helpers (hand-written: this code runs once per row and cell)
+// ------------------------------------------------------------------------------------------
+
+/// Byte ranges `(start, end)` of every `<tag ...>` / `<tag .../>` (name followed by space, `>` or `/`).
+fn tags<'a>(xml: &'a str, tag: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let b = xml.as_bytes();
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(p) = xml[from..].find(tag).map(|p| p + from) {
+            from = p + tag.len();
+            if !matches!(b.get(p + tag.len()), Some(c) if c.is_ascii_whitespace() || *c == b'>' || *c == b'/') {
+                continue;
+            }
+            let end = xml[p..].find('>')? + p + 1;
+            from = end;
+            return Some((p, end));
+        }
+        None
+    })
+}
+
+/// Rewrites the text of every `<open ...>text</close>` element (and optionally its open tag).
+fn rewrite_elements(xml: &str, open: &str, close: &str, head: Option<&dyn Fn(&str) -> String>, text: &dyn Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut last = 0;
+    let mut skip_to = 0;
+    for (s, e) in tags(xml, open) {
+        if s < skip_to {
+            continue;
+        }
+        let tag = &xml[s..e];
+        out.push_str(&xml[last..s]);
+        out.push_str(&head.map(|h| h(tag)).unwrap_or_else(|| tag.to_string()));
+        last = e;
+        if tag.ends_with("/>") {
+            continue;
+        }
+        let Some(c) = xml[e..].find(close).map(|c| c + e) else { break };
+        out.push_str(&escape_xml(&text(&decode_xml(&xml[e..c]))));
+        last = c;
+        skip_to = c;
+    }
+    out.push_str(&xml[last..]);
+    out
+}
+
+/// Maps the `ref` attribute of the given tags.
+fn rewrite_ref_attrs(xml: &str, names: &[&str], map: &RowMap) -> String {
+    let mut out = xml.to_string();
+    for name in names {
+        let mut next = String::with_capacity(out.len());
+        let mut last = 0;
+        for (s, e) in tags(&out, name) {
+            let tag = &out[s..e];
+            next.push_str(&out[last..s]);
+            match raw_attr(tag, "ref") {
+                Some(r) => next.push_str(&set_raw_attribute(tag, "ref", &map.range_text(r, None).unwrap_or_else(|| r.to_string()))),
+                None => next.push_str(tag),
+            }
+            last = e;
+        }
+        next.push_str(&out[last..]);
+        out = next;
+    }
+    out
+}
+
+/// Splits `$A$12` into (`$A$`, 12).
+fn split_ref(r: &str) -> Option<(&str, i64)> {
+    let b = r.as_bytes();
+    let end = scan_ref(b, 0)?;
+    if end != b.len() {
+        return None;
+    }
+    let digits = b.iter().position(u8::is_ascii_digit)?;
+    Some((&r[..digits], r[digits..].parse().ok()?))
+}
+
+// ------------------------------------------------------------------------------------------
+// Typed scalars
+// ------------------------------------------------------------------------------------------
+
+/// `\0{N|B}value\1text\0` → `text` (values mixed with other text stay strings).
+fn strip_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find(MARK) {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + 1..];
+        match (after.find(MARK_SEP), after.find(MARK)) {
+            (Some(sep), Some(end)) if sep < end => {
+                out.push_str(&after[sep + 1..end]);
+                rest = &after[end + 1..];
+            }
+            _ => rest = after,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn skip_ws(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_ascii_whitespace())
+}
+
+/// Matches a cell body that holds exactly one scalar marker:
+/// `[<f>…</f>] <is> <t …>\0{N|B}value\1text\0</t> </is>`. Returns (formula, kind, value).
+fn scalar_cell(inner: &str) -> Option<(&str, char, &str)> {
+    let mut rest = skip_ws(inner);
+    let mut formula = "";
+    if rest.starts_with("<f") && matches!(rest.as_bytes().get(2), Some(c) if c.is_ascii_whitespace() || *c == b'>') {
+        let gt = rest.find('>')?;
+        if rest[..gt].ends_with('/') {
+            return None;
+        }
+        let close = rest.find("</f>")?;
+        if rest[gt + 1..close].contains('<') {
+            return None;
+        }
+        formula = &rest[..close + 4];
+        rest = skip_ws(&rest[close + 4..]);
+    }
+    rest = skip_ws(rest.strip_prefix("<is>")?);
+    if !rest.starts_with("<t") || !matches!(rest.as_bytes().get(2), Some(c) if c.is_ascii_whitespace() || *c == b'>') {
+        return None;
+    }
+    rest = &rest[rest.find('>')? + 1..];
+    rest = rest.strip_prefix(MARK)?;
+    let kind = rest.chars().next().filter(|k| *k == 'N' || *k == 'B')?;
+    rest = &rest[1..];
+    let sep = rest.find(MARK_SEP)?;
+    let value = &rest[..sep];
+    if value.contains(MARK) {
+        return None;
+    }
+    rest = &rest[sep + 1..];
+    rest = &rest[rest.find(MARK)? + 1..];
+    rest = skip_ws(rest.strip_prefix("</t>")?);
+    rest = skip_ws(rest.strip_prefix("</is>")?);
+    rest.is_empty().then_some((formula, kind, value))
+}
+
+/// Turns cells that consist of a single numeric/boolean value into real typed cells. A formula in
+/// the cell is kept, with the value as its cached result.
 fn resolve_scalar_markers(xml: &str) -> String {
     if !xml.contains(MARK) {
         return xml.to_string();
     }
-    let cell =
-        crate::re!(r"<c\b([^>]*?)>(\s*<f\b[^>]*>[^<]*</f>)?\s*<is>\s*<t\b[^>]*>\x00([NB])([^\x01]*)\x01[^\x00]*\x00</t>\s*</is>\s*</c>");
-    let xml = cell.replace_all(xml, |c: &regex_lite::Captures| {
-        let mut head = remove_raw_attribute(&format!("<c{}>", &c[1]), "t");
-        if &c[3] == "B" {
-            head = set_raw_attribute(&head, "t", "b");
+    let mut out = String::with_capacity(xml.len());
+    let mut last = 0;
+    let mut skip_to = 0;
+    for (s, e) in tags(xml, "<c") {
+        if s < skip_to {
+            continue;
         }
-        format!("{head}<v>{}</v></c>", &c[4])
-    });
-    // Values mixed with other text stay strings.
-    crate::re!(r"\x00[NB][^\x01]*\x01([^\x00]*)\x00").replace_all(&xml, "$1").into_owned()
+        let tag = &xml[s..e];
+        if tag.ends_with("/>") {
+            continue;
+        }
+        let Some(close) = xml[e..].find("</c>").map(|c| c + e) else { break };
+        skip_to = close;
+        let inner = &xml[e..close];
+        if !inner.contains(MARK) {
+            continue;
+        }
+        out.push_str(&strip_markers(&xml[last..s]));
+        match scalar_cell(inner) {
+            Some((formula, kind, value)) => {
+                let mut head = remove_raw_attribute(tag, "t");
+                if kind == 'B' {
+                    head = set_raw_attribute(&head, "t", "b");
+                }
+                out.push_str(&head);
+                out.push_str(formula);
+                out.push_str("<v>");
+                out.push_str(value);
+                out.push_str("</v>");
+            }
+            None => {
+                out.push_str(tag);
+                out.push_str(&strip_markers(inner));
+            }
+        }
+        last = close;
+    }
+    out.push_str(&strip_markers(&xml[last..]));
+    out
 }
 
 // ------------------------------------------------------------------------------------------
@@ -205,17 +418,32 @@ fn resolve_scalar_markers(xml: &str) -> String {
 // ------------------------------------------------------------------------------------------
 
 fn strip_gaps(xml: &str) -> String {
-    crate::re!(r#"\sdata-ct-gap="\d+""#).replace_all(xml, "").into_owned()
+    let needle = " data-ct-gap=\"";
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(p) = rest.find(needle) {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + needle.len()..];
+        rest = after.find('"').map(|q| &after[q + 1..]).unwrap_or(after);
+    }
+    out.push_str(rest);
+    out
 }
 
-struct RowMap<'a> {
+/// Where template rows went after rendering.
+#[derive(Debug, Clone)]
+pub struct RowMap {
+    /// Original row → new numbers of its copies, in order.
     map: HashMap<i64, Vec<i64>>,
+    /// Original rows that are still present, sorted.
     sorted: Vec<i64>,
-    template_rows: &'a BTreeSet<i64>,
+    /// Template rows removed by empty loops.
+    removed: BTreeSet<i64>,
 }
 
-impl RowMap<'_> {
-    /// Maps an original row reference to its new number. `end` = last copy (for range ends).
+impl RowMap {
+    /// Maps an original row to its new number; `end` = last copy (for range ends).
+    /// `None` when the row was removed by an empty loop.
     fn row(&self, r: i64, end: bool, own: Option<(i64, i64)>) -> Option<i64> {
         if let Some((o, n)) = own {
             if r == o {
@@ -225,41 +453,57 @@ impl RowMap<'_> {
         if let Some(list) = self.map.get(&r) {
             return Some(if end { *list.last()? } else { list[0] });
         }
-        if self.template_rows.contains(&r) {
-            return None; // the row was removed by an empty loop
+        if self.removed.contains(&r) {
+            return None;
         }
         // A row that is not in the template (empty row): shift by the delta of the closest row above.
-        let base = self.sorted.iter().take_while(|o| **o < r).last();
-        match base {
-            None => Some(r),
+        let at = self.sorted.partition_point(|o| *o < r);
+        if at == 0 {
+            return Some(r);
+        }
+        let base = self.sorted[at - 1];
+        let l = &self.map[&base];
+        Some(r + (l[l.len() - 1] - base))
+    }
+
+    /// Maps a row span, clamping ends that fall on removed rows. `None` when every row is gone.
+    fn span(&self, a: i64, b: i64, own: Option<(i64, i64)>) -> Option<(i64, i64)> {
+        let (mut s, mut e) = (a.min(b), a.max(b));
+        while s <= e && self.removed.contains(&s) {
+            s += 1;
+        }
+        while e >= s && self.removed.contains(&e) {
+            e -= 1;
+        }
+        if s > e {
+            return None;
+        }
+        Some((self.row(s, false, own)?, self.row(e, true, own)?))
+    }
+
+    /// Maps `A1` or `A1:B5` text. `None` when the referenced rows were removed.
+    fn ref_text(&self, a: &str, b: Option<&str>, own: Option<(i64, i64)>) -> Option<String> {
+        let Some((pa, ra)) = split_ref(a) else { return Some(b.map(|b| format!("{a}:{b}")).unwrap_or_else(|| a.to_string())) };
+        match b {
+            None => self.row(ra, false, own).map(|n| format!("{pa}{n}")),
             Some(b) => {
-                let l = &self.map[b];
-                Some(r + (l[l.len() - 1] - b))
+                let Some((pb, rb)) = split_ref(b) else { return Some(format!("{a}:{b}")) };
+                let (x, y) = self.span(ra, rb, own)?;
+                let (x, y) = if ra <= rb { (x, y) } else { (y, x) };
+                Some(format!("{pa}{x}:{pb}{y}"))
             }
         }
     }
 
-    fn cell_ref(&self, s: &str, end: bool, own: Option<(i64, i64)>) -> String {
-        crate::re!(r"(\$?)([A-Z]{1,3})(\$?)(\d+)")
-            .replace_all(s, |c: &regex_lite::Captures| {
-                let n = c[4].parse::<i64>().ok().and_then(|r| self.row(r, end, own));
-                match n {
-                    Some(n) => format!("{}{}{}{}", &c[1], &c[2], &c[3], n),
-                    None => c[0].to_string(),
-                }
-            })
-            .into_owned()
-    }
-
-    fn range(&self, r: &str, own: Option<(i64, i64)>) -> String {
+    fn range_text(&self, r: &str, own: Option<(i64, i64)>) -> Option<String> {
         match r.split_once(':') {
-            None => self.cell_ref(r, false, own),
-            Some((a, b)) => format!("{}:{}", self.cell_ref(a, false, own), self.cell_ref(b, true, own)),
+            None => self.ref_text(r, None, own),
+            Some((a, b)) => self.ref_text(a, Some(b), own),
         }
     }
 
     fn formula(&self, f: &str, own: (i64, i64)) -> String {
-        map_formula(f, &|a, end| self.cell_ref(a, end, Some(own)))
+        map_formula(f, &|a, b| self.ref_text(a, b, Some(own)).unwrap_or_else(|| "#REF!".into()))
     }
 }
 
@@ -293,62 +537,49 @@ fn ref_boundary_ok(b: &[u8], end: usize) -> bool {
     !matches!(b.get(end), Some(c) if c.is_ascii_alphanumeric() || *c == b'_' || *c == b'(')
 }
 
-/// Rewrites cell references of a formula, leaving string literals and references to other sheets
-/// (`Sheet2!A1`, `'My sheet'!A1`) untouched.
-pub fn map_formula(f: &str, map: &dyn Fn(&str, bool) -> String) -> String {
+/// End of a `"…"` string literal starting at `i` (with `""` escapes).
+fn string_end(b: &[u8], i: usize, q: u8) -> Option<usize> {
+    let mut j = i + 1;
+    while j < b.len() {
+        if b[j] == q {
+            if b.get(j + 1) == Some(&q) {
+                j += 2;
+                continue;
+            }
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Rewrites unqualified cell references of a formula (`A1`, `$B$2:C5`). String literals and
+/// references to sheets (`Sheet2!A1`, `'My sheet'!A1`) are left untouched. `map` receives a
+/// reference or both ends of a range and returns the replacement.
+pub fn map_formula(f: &str, map: &dyn Fn(&str, Option<&str>) -> String) -> String {
     let b = f.as_bytes();
     let mut out = String::with_capacity(f.len());
     let mut seg = 0;
     let mut i = 0;
     while i < b.len() {
         let skip_to = match b[i] {
-            b'"' => {
-                let mut j = i + 1;
-                let mut end = None;
-                while j < b.len() {
-                    if b[j] == b'"' {
-                        if b.get(j + 1) == Some(&b'"') {
-                            j += 2;
-                            continue;
-                        }
-                        end = Some(j + 1);
-                        break;
-                    }
-                    j += 1;
+            b'"' => string_end(b, i, b'"'),
+            b'\'' => string_end(b, i, b'\'').and_then(|e| {
+                if b.get(e) != Some(&b'!') {
+                    return None;
                 }
-                end
-            }
-            b'\'' => {
-                let mut j = i + 1;
-                let mut end = None;
-                while j < b.len() {
-                    if b[j] == b'\'' {
-                        if b.get(j + 1) == Some(&b'\'') {
-                            j += 2;
-                            continue;
-                        }
-                        end = Some(j + 1);
-                        break;
+                let r1 = scan_ref(b, e + 1)?;
+                if b.get(r1) == Some(&b':') {
+                    if let Some(r2) = scan_ref(b, r1 + 1) {
+                        return Some(r2);
                     }
-                    j += 1;
                 }
-                end.and_then(|e| {
-                    if b.get(e) != Some(&b'!') {
-                        return None;
-                    }
-                    let r1 = scan_ref(b, e + 1)?;
-                    if b.get(r1) == Some(&b':') {
-                        if let Some(r2) = scan_ref(b, r1 + 1) {
-                            return Some(r2);
-                        }
-                    }
-                    Some(r1)
-                })
-            }
+                Some(r1)
+            }),
             _ => None,
         };
         if let Some(e) = skip_to {
-            out.push_str(&map_refs(&f[seg..i], map));
+            map_refs(&f[seg..i], map, &mut out);
             out.push_str(&f[i..e]);
             i = e;
             seg = e;
@@ -356,186 +587,297 @@ pub fn map_formula(f: &str, map: &dyn Fn(&str, bool) -> String) -> String {
         }
         i += 1;
     }
-    out.push_str(&map_refs(&f[seg..], map));
+    map_refs(&f[seg..], map, &mut out);
     out
 }
 
-fn map_refs(s: &str, map: &dyn Fn(&str, bool) -> String) -> String {
+fn map_refs(s: &str, map: &dyn Fn(&str, Option<&str>) -> String, out: &mut String) {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let mut last = 0;
     while i < b.len() {
-        let pre_ok = i == 0 || !matches!(b[i - 1], c if c.is_ascii_alphanumeric() || c == b'_' || c == b'!' || c == b'.');
-        if pre_ok && (b[i] == b'$' || b[i].is_ascii_uppercase()) {
-            if let Some(r1) = scan_ref(b, i) {
-                let range_end = if b.get(r1) == Some(&b':') { scan_ref(b, r1 + 1).filter(|e| ref_boundary_ok(b, *e)) } else { None };
-                let matched = match range_end {
-                    Some(r2) => Some((r1, Some(r2))),
-                    None if ref_boundary_ok(b, r1) => Some((r1, None)),
-                    None => None,
-                };
-                if let Some((r1, r2)) = matched {
-                    out.push_str(&s[last..i]);
-                    out.push_str(&map(&s[i..r1], false));
-                    let end = match r2 {
-                        Some(r2) => {
-                            out.push(':');
-                            out.push_str(&map(&s[r1 + 1..r2], true));
-                            r2
-                        }
-                        None => r1,
-                    };
-                    i = end;
-                    last = end;
-                    continue;
-                }
-            }
+        if !(b[i] == b'$' || b[i].is_ascii_uppercase()) {
+            i += 1;
+            continue;
         }
-        i += 1;
+        let prev = if i == 0 { None } else { Some(b[i - 1]) };
+        if matches!(prev, Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
+            i += 1;
+            continue;
+        }
+        let Some(r1) = scan_ref(b, i) else {
+            i += 1;
+            continue;
+        };
+        let r2 = if b.get(r1) == Some(&b':') { scan_ref(b, r1 + 1).filter(|e| ref_boundary_ok(b, *e)) } else { None };
+        if prev == Some(b'!') {
+            // qualified reference (Sheet2!A1:B2): another sheet's rows, skip it whole
+            i = r2.unwrap_or(r1);
+            continue;
+        }
+        let end = match r2 {
+            Some(r2) => r2,
+            None if ref_boundary_ok(b, r1) => r1,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push_str(&s[last..i]);
+        out.push_str(&map(&s[i..r1], r2.map(|r2| &s[r1 + 1..r2])));
+        i = end;
+        last = end;
     }
     out.push_str(&s[last..]);
+}
+
+/// Rewrites references qualified with one of `sheets` (`Sheet1!A5`, `'My sheet'!A1:B2`).
+fn map_qualified(f: &str, sheets: &[(&str, &RowMap)]) -> String {
+    let b = f.as_bytes();
+    let name_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c >= 0x80;
+    let mut out = String::with_capacity(f.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let (name, bang) = match b[i] {
+            b'"' => {
+                i = string_end(b, i, b'"').unwrap_or(b.len());
+                continue;
+            }
+            b'\'' => match string_end(b, i, b'\'') {
+                Some(e) if b.get(e) == Some(&b'!') => (f[i + 1..e - 1].replace("''", "'"), e),
+                Some(e) => {
+                    i = e;
+                    continue;
+                }
+                None => break,
+            },
+            c if name_char(c) && (i == 0 || !name_char(b[i - 1])) => {
+                let mut e = i;
+                while e < b.len() && name_char(b[e]) {
+                    e += 1;
+                }
+                if b.get(e) != Some(&b'!') {
+                    i = e;
+                    continue;
+                }
+                (f[i..e].to_string(), e)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some(map) = sheets.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)).map(|(_, m)| *m) else {
+            i = bang + 1;
+            continue;
+        };
+        let Some(r1) = scan_ref(b, bang + 1) else {
+            i = bang + 1;
+            continue;
+        };
+        let r2 = if b.get(r1) == Some(&b':') { scan_ref(b, r1 + 1) } else { None };
+        let end = r2.unwrap_or(r1);
+        let mapped = map.ref_text(&f[bang + 1..r1], r2.map(|r2| &f[r1 + 1..r2]), None);
+        out.push_str(&f[last..i]);
+        match mapped {
+            Some(t) => {
+                out.push_str(&f[i..=bang]);
+                out.push_str(&t);
+            }
+            None => out.push_str("#REF!"),
+        }
+        i = end;
+        last = end;
+    }
+    out.push_str(&f[last..]);
     out
 }
 
-fn renumber_rows(xml: &str, template_rows: &BTreeSet<i64>) -> String {
-    let Some(sd_start) = xml.find("<sheetData") else { return xml.to_string() };
-    let Some(sd_end) = xml.find("</sheetData>") else { return strip_gaps(xml) };
-    if sd_end < sd_start {
-        return strip_gaps(xml);
+struct RowSpan<'a> {
+    start: usize,
+    /// Attributes of the open tag (between `<row` and `>` / `/>`).
+    attrs: &'a str,
+    /// Inner XML, `None` for `<row/>`.
+    inner: Option<&'a str>,
+    end: usize,
+}
+
+fn rows(body: &str) -> Vec<RowSpan<'_>> {
+    let mut out = Vec::new();
+    let mut skip_to = 0;
+    for (s, e) in tags(body, "<row") {
+        if s < skip_to {
+            continue;
+        }
+        let tag = &body[s..e];
+        if let Some(attrs) = tag.strip_suffix("/>") {
+            out.push(RowSpan { start: s, attrs: &attrs[4..], inner: None, end: e });
+            continue;
+        }
+        let Some(close) = body[e..].find("</row>").map(|c| c + e) else { break };
+        out.push(RowSpan { start: s, attrs: &tag[4..tag.len() - 1], inner: Some(&body[e..close]), end: close + 6 });
+        skip_to = close + 6;
     }
-    let row_re = crate::re!(r"<row\b([^>]*?)(/>|>([\s\S]*?)</row>)");
+    out
+}
+
+fn tag_attr_num(attrs: &str, name: &str) -> Option<i64> {
+    raw_attr(&format!("<x{attrs}>"), name).and_then(|v| v.parse().ok())
+}
+
+fn renumber_rows(xml: &str, template_rows: &BTreeSet<i64>) -> (String, Option<RowMap>) {
+    let Some(sd_start) = xml.find("<sheetData") else { return (xml.to_string(), None) };
+    let Some(sd_end) = xml.find("</sheetData>").filter(|e| *e >= sd_start) else { return (strip_gaps(xml), None) };
     let body = &xml[sd_start..sd_end];
+    let spans = rows(body);
 
     // pass 1: assign new row numbers
-    let mut rows: Vec<(i64, i64)> = Vec::new();
+    let mut numbers: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
     let mut cur = 0i64;
     let mut prev_orig = 0i64;
-    for c in row_re.captures_iter(body) {
-        let gap = tag_attr(&c[1], GAP_ATTR).and_then(|g| g.parse().ok()).unwrap_or(1);
-        let orig = tag_attr(&c[1], "r").and_then(|r| r.parse().ok()).unwrap_or(prev_orig + 1);
+    for r in &spans {
+        let orig = tag_attr_num(r.attrs, "r").unwrap_or(prev_orig + 1);
+        // a copy of a looped row starts right after the previous copy
+        let gap = if orig <= prev_orig { 1 } else { tag_attr_num(r.attrs, GAP_ATTR).unwrap_or(1) };
         cur += gap;
-        rows.push((orig, cur));
+        numbers.push((orig, cur));
         prev_orig = orig;
     }
     let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
-    for (o, n) in &rows {
+    for (o, n) in &numbers {
         map.entry(*o).or_default().push(*n);
     }
-    let changed = rows.iter().any(|(o, n)| o != n) || template_rows.iter().any(|r| !map.contains_key(r)) || rows.len() != map.len();
+    let removed: BTreeSet<i64> = template_rows.iter().copied().filter(|r| !map.contains_key(r)).collect();
+    let changed = numbers.iter().any(|(o, n)| o != n) || !removed.is_empty() || numbers.len() != map.len();
     if !changed {
-        return strip_gaps(xml);
+        return (strip_gaps(xml), None);
     }
     let mut sorted: Vec<i64> = map.keys().copied().collect();
     sorted.sort_unstable();
-    let rm = RowMap { map, sorted, template_rows };
+    let rm = RowMap { map, sorted, removed };
 
     // pass 2: rewrite rows, cells and formulas
-    let mut n = 0;
-    let new_body = row_re.replace_all(body, |c: &regex_lite::Captures| {
-        let (orig, next) = rows.get(n).copied().unwrap_or((0, 0));
-        n += 1;
-        let self_closing = &c[2] == "/>";
-        let head = remove_raw_attribute(&format!("<row{}{}", &c[1], if self_closing { "/>" } else { ">" }), GAP_ATTR);
-        let head = set_raw_attribute(&head, "r", &next.to_string());
-        if self_closing {
-            return head;
+    let mut out = String::with_capacity(xml.len() + xml.len() / 8);
+    out.push_str(&xml[..sd_start]);
+    let mut last = 0;
+    for (r, &(orig, next)) in spans.iter().zip(&numbers) {
+        out.push_str(&body[last..r.start]);
+        last = r.end;
+        let close = if r.inner.is_none() { "/>" } else { ">" };
+        let head = remove_raw_attribute(&format!("<row{}{close}", r.attrs), GAP_ATTR);
+        out.push_str(&set_raw_attribute(&head, "r", &next.to_string()));
+        let Some(inner) = r.inner else { continue };
+        let next_s = next.to_string();
+        let mut cells = String::with_capacity(inner.len() + 16);
+        let mut cl = 0;
+        for (s, e) in tags(inner, "<c") {
+            let tag = &inner[s..e];
+            cells.push_str(&inner[cl..s]);
+            cl = e;
+            match raw_attr(tag, "r") {
+                Some(v) => {
+                    let col = v.trim_end_matches(|c: char| c.is_ascii_digit());
+                    cells.push_str(&set_raw_attribute(tag, "r", &format!("{col}{next_s}")));
+                }
+                None => cells.push_str(tag),
+            }
         }
-        let inner = c.get(3).map(|m| m.as_str()).unwrap_or("");
-        let content = crate::re!(r#"(<c\b[^>]*?\sr=")([A-Z]+)\d+""#)
-            .replace_all(inner, |m: &regex_lite::Captures| format!("{}{}{}\"", &m[1], &m[2], next));
-        let content = rewrite_formulas(&content, &rm, (orig, next));
-        format!("{head}{content}</row>")
-    });
-    let mut out = format!("{}{}{}", &xml[..sd_start], new_body, &xml[sd_end..]);
+        cells.push_str(&inner[cl..]);
+        if cells.contains("<f") {
+            let own = (orig, next);
+            let ref_head = |tag: &str| match raw_attr(tag, "ref") {
+                Some(v) => set_raw_attribute(tag, "ref", &rm.range_text(v, Some(own)).unwrap_or_else(|| v.to_string())),
+                None => tag.to_string(),
+            };
+            cells = rewrite_elements(&cells, "<f", "</f>", Some(&ref_head), &|f| rm.formula(f, own));
+        }
+        out.push_str(&cells);
+        out.push_str("</row>");
+    }
+    out.push_str(&body[last..]);
+    out.push_str(&xml[sd_end..]);
+
+    let out = rewrite_sheet_ranges(&out, &rm);
+    (out, Some(rm))
+}
+
+/// Merges, conditional formatting, data validation, hyperlinks and the auto filter.
+fn rewrite_sheet_ranges(xml: &str, rm: &RowMap) -> String {
+    let mut out = xml.to_string();
 
     // merged cells: duplicate merges inside repeated rows, shift the others
-    out = crate::re!(r"<mergeCells\b[^>]*>([\s\S]*?)</mergeCells>")
-        .replace(&out, |c: &regex_lite::Captures| {
-            let mut merges: Vec<String> = Vec::new();
-            for m in crate::re!(r#"<mergeCell\b[^>]*\sref="([^"]*)"[^>]*/>"#).captures_iter(&c[1]) {
-                let r = &m[1];
-                let (a, b) = r.split_once(':').unwrap_or((r, r));
-                let row_of = |s: &str| s.chars().filter(char::is_ascii_digit).collect::<String>().parse::<i64>().unwrap_or(0);
-                let col_of = |s: &str| s.chars().filter(|ch| ch.is_ascii_alphabetic()).collect::<String>();
-                let (ra, rb, ca, cb) = (row_of(a), row_of(b), col_of(a), col_of(b));
-                if ra == rb {
-                    if let Some(list) = rm.map.get(&ra) {
-                        for r in list {
-                            merges.push(format!("{ca}{r}:{cb}{r}"));
-                        }
-                        continue;
-                    }
+    if let (Some(s), Some(e)) = (out.find("<mergeCells"), out.find("</mergeCells>")) {
+        let mut merges: Vec<String> = Vec::new();
+        for (ms, me) in tags(&out[s..e], "<mergeCell") {
+            let Some(r) = raw_attr(&out[s + ms..s + me], "ref") else { continue };
+            let (a, b) = r.split_once(':').unwrap_or((r, r));
+            let (Some((ca, ra)), Some((cb, rb))) = (split_ref(a), split_ref(b)) else { continue };
+            if ra == rb {
+                if let Some(list) = rm.map.get(&ra) {
+                    merges.extend(list.iter().map(|n| format!("{ca}{n}:{cb}{n}")));
+                    continue;
                 }
-                let (Some(na), Some(nb)) = (rm.row(ra, false, None), rm.row(rb, true, None)) else { continue };
-                merges.push(format!("{ca}{na}:{cb}{nb}"));
             }
-            if merges.is_empty() {
-                return String::new();
+            if let Some((x, y)) = rm.span(ra, rb, None) {
+                merges.push(format!("{ca}{x}:{cb}{y}"));
             }
+        }
+        let block = if merges.is_empty() {
+            String::new()
+        } else {
             let inner: String = merges.iter().map(|r| format!("<mergeCell ref=\"{r}\"/>")).collect();
             format!("<mergeCells count=\"{}\">{inner}</mergeCells>", merges.len())
-        })
-        .into_owned();
-    // ranges in conditional formatting, data validation and hyperlinks
-    out = crate::re!(r#"(<(?:conditionalFormatting|dataValidation)\b[^>]*\ssqref=")([^"]*)""#)
-        .replace_all(&out, |c: &regex_lite::Captures| {
-            let list: Vec<String> = c[2].split_whitespace().map(|r| rm.range(r, None)).collect();
-            format!("{}{}\"", &c[1], list.join(" "))
-        })
-        .into_owned();
-    out = crate::re!(r#"(<hyperlink\b[^>]*\sref=")([^"]*)""#)
-        .replace_all(&out, |c: &regex_lite::Captures| format!("{}{}\"", &c[1], rm.range(&c[2], None)))
-        .into_owned();
+        };
+        out = format!("{}{}{}", &out[..s], block, &out[e + "</mergeCells>".len()..]);
+    }
+
+    // ranges in conditional formatting and data validation; drop the ones whose rows are all gone
+    for (name, close) in [("<conditionalFormatting", "</conditionalFormatting>"), ("<dataValidation", "</dataValidation>")] {
+        let mut next = String::with_capacity(out.len());
+        let mut last = 0;
+        let mut skip_to = 0;
+        for (s, e) in tags(&out, name) {
+            if s < skip_to {
+                continue;
+            }
+            let tag = &out[s..e];
+            let Some(sqref) = raw_attr(tag, "sqref") else { continue };
+            let list: Vec<String> = sqref.split_whitespace().filter_map(|r| rm.range_text(r, None)).collect();
+            let elem_end = if tag.ends_with("/>") { e } else { out[e..].find(close).map(|c| e + c + close.len()).unwrap_or(e) };
+            next.push_str(&out[last..s]);
+            if !list.is_empty() {
+                next.push_str(&set_raw_attribute(tag, "sqref", &list.join(" ")));
+                next.push_str(&out[e..elem_end]);
+            }
+            last = elem_end;
+            skip_to = elem_end;
+        }
+        next.push_str(&out[last..]);
+        out = next;
+    }
+
+    // hyperlinks: shift, drop links to removed rows
+    let mut next = String::with_capacity(out.len());
+    let mut last = 0;
+    for (s, e) in tags(&out, "<hyperlink") {
+        let tag = &out[s..e];
+        let Some(r) = raw_attr(tag, "ref") else { continue };
+        next.push_str(&out[last..s]);
+        if let Some(m) = rm.range_text(r, None) {
+            next.push_str(&set_raw_attribute(tag, "ref", &m));
+        }
+        last = e;
+    }
+    next.push_str(&out[last..]);
+    out = rewrite_ref_attrs(&next, &["<autoFilter"], rm);
+
     // the used-range hint is optional; drop it rather than keep a wrong one
-    crate::re!(r"<dimension\b[^>]*/>").replacen(&out, 1, "").into_owned()
-}
-
-/// Rewrites `<f ref="...">formula</f>` inside a row.
-fn rewrite_formulas(content: &str, rm: &RowMap, own: (i64, i64)) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut rest = content;
-    loop {
-        let Some(p) = find_f(rest) else {
-            out.push_str(rest);
-            return out;
-        };
-        out.push_str(&rest[..p]);
-        let Some(tag_end) = rest[p..].find('>').map(|e| p + e + 1) else {
-            out.push_str(&rest[p..]);
-            return out;
-        };
-        let open = &rest[p..tag_end];
-        let open = match raw_attr(open, "ref") {
-            Some(r) => set_raw_attribute(open, "ref", &rm.range(r, Some(own))),
-            None => open.to_string(),
-        };
-        if open.ends_with("/>") {
-            out.push_str(&open);
-            rest = &rest[tag_end..];
-            continue;
-        }
-        let Some(close) = rest[tag_end..].find("</f>").map(|e| tag_end + e) else {
-            out.push_str(&open);
-            out.push_str(&rest[tag_end..]);
-            return out;
-        };
-        out.push_str(&open);
-        out.push_str(&escape_xml(&rm.formula(&decode_xml(&rest[tag_end..close]), own)));
-        out.push_str("</f>");
-        rest = &rest[close + 4..];
+    let dimension = tags(&out, "<dimension").next();
+    if let Some((s, e)) = dimension {
+        out.replace_range(s..e, "");
     }
-}
-
-fn find_f(s: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(p) = s[from..].find("<f").map(|p| p + from) {
-        from = p + 2;
-        if matches!(s.as_bytes().get(p + 2), Some(c) if c.is_ascii_whitespace() || *c == b'>' || *c == b'/') {
-            return Some(p);
-        }
-    }
-    None
+    out
 }
 
 /// Text of an element's children, ignoring phonetic runs.
@@ -549,8 +891,12 @@ mod tests {
 
     #[test]
     fn formula_refs() {
-        let shift = |s: &str, _end: bool| {
+        let bump = |s: &str| {
             crate::re!(r"\d+").replace_all(s, |c: &regex_lite::Captures| (c[0].parse::<i64>().unwrap() + 10).to_string()).into_owned()
+        };
+        let shift = |a: &str, b: Option<&str>| match b {
+            Some(b) => format!("{}:{}", bump(a), bump(b)),
+            None => bump(a),
         };
         assert_eq!(map_formula("SUM(D3:D5)+A1*$B$2", &shift), "SUM(D13:D15)+A11*$B$12");
         assert_eq!(map_formula("\"A1\"&Sheet2!A1&'My sheet'!B2&LOG10(A1)", &shift), "\"A1\"&Sheet2!A1&'My sheet'!B2&LOG10(A11)");

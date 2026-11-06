@@ -3,7 +3,7 @@
 use super::escape::{decode_xml, escape_into};
 use super::tokenizer::{parse_attributes, tokenize, TokKind};
 use crate::error::{Error, Result};
-use crate::limits::exceeds;
+use crate::limits::{exceeds, xml_depth};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct XmlElement {
@@ -165,8 +165,8 @@ pub fn parse_xml(xml: &str, max_depth: u64) -> Result<XmlDocument> {
                 } else {
                     // An element after the root is parsed and then dropped by `attach`.
                     stack.push(el);
-                    if exceeds(stack.len() as u64, max_depth) {
-                        return Err(Error::limit("maxXmlDepth", max_depth));
+                    if exceeds(stack.len() as u64, xml_depth(max_depth)) {
+                        return Err(Error::limit("maxXmlDepth", xml_depth(max_depth)));
                     }
                 }
             }
@@ -258,7 +258,7 @@ pub fn parse_fragment(xml: &str, max_depth: u64) -> Result<Vec<XmlNode>> {
     if xml.is_empty() {
         return Ok(Vec::new());
     }
-    let depth = if max_depth == 0 { 0 } else { max_depth + 1 };
+    let depth = xml_depth(max_depth) + 1;
     Ok(parse_xml(&format!("<__root>{xml}</__root>"), depth)?.root.children)
 }
 

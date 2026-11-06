@@ -182,9 +182,6 @@ impl FormatHooks for Pptx {
         let id = match cnv.and_then(|t| raw_attr(t, "id")).filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())) {
             Some(v) => v.to_string(),
             None => {
-                if ctx.shape_id == 0 {
-                    ctx.shape_id = 0x7000;
-                }
                 ctx.shape_id += 1;
                 ctx.shape_id.to_string()
             }
@@ -205,7 +202,7 @@ impl FormatHooks for Pptx {
             x = b.x + ((b.cx as f64 - cx) / 2.0).round() as i64;
             y = b.y + ((b.cy as f64 - cy) / 2.0).round() as i64;
         }
-        let r_id = ctx.pkg.add_image(&part, "ppt/media", img.data.clone(), &img.extension);
+        let r_id = ctx.pkg.add_image(&part, "ppt/media", img.data.clone(), &img.extension)?;
         let (cx, cy) = (cx as i64, cy as i64);
         Ok(format!(
             "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"{name}\" descr=\"{}\"/>\

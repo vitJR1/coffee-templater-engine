@@ -49,10 +49,7 @@ impl FormatHooks for Docx {
 
     fn render_image(&self, img: &ResolvedImage, ctx: &mut RenderCtx, _shape: Option<&str>) -> Result<String> {
         let part = ctx.part.clone();
-        let r_id = ctx.pkg.add_image(&part, "word/media", img.data.clone(), &img.extension);
-        if ctx.doc_pr == 0 {
-            ctx.doc_pr = 0x7000;
-        }
+        let r_id = ctx.pkg.add_image(&part, "word/media", img.data.clone(), &img.extension)?;
         ctx.doc_pr += 1;
         let id = ctx.doc_pr;
         let cx = (img.width * EMU_PER_PX).round() as i64;
@@ -60,7 +57,7 @@ impl FormatHooks for Docx {
         let alt = escape_attr(&img.alt);
         let a = "http://schemas.openxmlformats.org/drawingml/2006/main";
         let pic = "http://schemas.openxmlformats.org/drawingml/2006/picture";
-        let ext = &img.extension;
+        let ext = escape_attr(&img.extension);
         Ok(format!(
             "</w:t><w:drawing>\
 <wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\

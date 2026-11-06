@@ -7,9 +7,10 @@
 //! are freed with `ct_free(ptr, frame_len + 4)`. A host answering a callback must therefore
 //! allocate exactly `frame_len + 4` bytes with `ct_alloc`.
 
-use coffee_abi::{HostTransport, Instance, ABI_VERSION};
+use coffee_abi::{error_response, HostTransport, Instance, ABI_VERSION};
+use coffee_core::ErrorCode;
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::RefCell;
+use std::cell::Cell;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "ct_host")]
@@ -77,8 +78,10 @@ struct WasmHost;
 
 impl HostTransport for WasmHost {
     fn call(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+        STATE.set(IN_CALLBACK);
         // SAFETY: the request slice lives in module memory for the duration of the call.
         let ptr = unsafe { host_call(request.as_ptr() as usize as u32, request.len() as u32) };
+        STATE.set(BUSY);
         if ptr == 0 {
             return None;
         }
@@ -93,8 +96,16 @@ impl HostTransport for WasmHost {
     }
 }
 
+// The module is single-threaded. A trap (panics abort on wasm32) can stop a call half way; the
+// state flag notices that on the next call, and the instance is replaced instead of being reused
+// in an unknown state.
+const IDLE: u8 = 0;
+const BUSY: u8 = 1;
+const IN_CALLBACK: u8 = 2;
+
 thread_local! {
-    static INSTANCE: RefCell<Option<Instance>> = const { RefCell::new(None) };
+    static STATE: Cell<u8> = const { Cell::new(IDLE) };
+    static INSTANCE: Cell<Option<Box<Instance>>> = const { Cell::new(None) };
 }
 
 /// Executes a request frame; returns a pointer to `[u32 frame_len][response frame]`.
@@ -103,11 +114,35 @@ thread_local! {
 /// `req_ptr..req_ptr+req_len` must be readable module memory (allocated with `ct_alloc`).
 #[no_mangle]
 pub unsafe extern "C" fn ct_call(req_ptr: u32, req_len: u32) -> u32 {
+    match STATE.get() {
+        IN_CALLBACK => {
+            // Either a re-entrant call from a host callback, or a callback that trapped (a host
+            // exception unwound through the module). Both are reported once; the state is reset.
+            // This is safe in both cases: a running call owns its instance (it was taken out).
+            STATE.set(IDLE);
+            let r = error_response(
+                ErrorCode::InvalidRequest,
+                "ct_call was called from a host callback, or a host callback trapped; the instance was reset",
+            );
+            return to_prefixed(&r);
+        }
+        BUSY => {
+            // The previous call trapped. Its instance may be inconsistent: leak it, start over.
+            std::mem::forget(INSTANCE.take());
+            STATE.set(IDLE);
+            let r = error_response(
+                ErrorCode::Internal,
+                "The previous call trapped; the instance was reset and its templates were dropped. Recompile them.",
+            );
+            return to_prefixed(&r);
+        }
+        _ => {}
+    }
+    STATE.set(BUSY);
     let request = if req_len == 0 { &[][..] } else { std::slice::from_raw_parts(req_ptr as usize as *const u8, req_len as usize) };
-    let response = INSTANCE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let instance = slot.get_or_insert_with(|| Instance::new(Box::new(WasmHost)));
-        instance.call(request)
-    });
+    let mut instance = INSTANCE.take().unwrap_or_else(|| Box::new(Instance::new(Box::new(WasmHost))));
+    let response = instance.call(request);
+    INSTANCE.set(Some(instance));
+    STATE.set(IDLE);
     to_prefixed(&response)
 }

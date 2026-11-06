@@ -17,6 +17,11 @@ pub struct ResolvedImage {
     pub alt: String,
 }
 
+/// File extensions used in package paths and content types: `[a-z0-9]{1,10}`.
+pub fn is_safe_extension(ext: &str) -> bool {
+    (1..=10).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 pub fn is_image_value(v: &Value) -> bool {
     matches!(v, Value::Object(o) if o.contains_key("data"))
 }
@@ -54,6 +59,9 @@ pub fn resolve_image(value: &Value) -> Result<ResolvedImage, String> {
     let extension = ext_given.or_else(|| info.as_ref().map(|i| i.0.to_string())).unwrap_or_default().trim_start_matches('.').to_lowercase();
     if extension.is_empty() {
         return Err("Cannot detect image format; pass `extension`".into());
+    }
+    if !is_safe_extension(&extension) {
+        return Err(format!("Invalid image extension {extension:?}: expected 1-10 letters or digits"));
     }
     let natural = info.filter(|i| i.1 > 0.0 && i.2 > 0.0);
     let (w, h) = (opt_num(o.get("width")), opt_num(o.get("height")));

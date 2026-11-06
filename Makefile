@@ -14,6 +14,7 @@ wasm:
 
 conformance: wasm
 	node conformance/run-wasm.mjs dist/coffee_core.wasm
+	node conformance/trap-recovery.mjs dist/coffee_core.wasm
 
 capi:
 	cargo build -p coffee-capi --release

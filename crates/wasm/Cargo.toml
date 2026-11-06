@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 coffee-abi.workspace = true
+coffee-core.workspace = true

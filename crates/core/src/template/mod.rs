@@ -26,6 +26,19 @@ pub struct Template {
     compiled: Vec<CompiledPart>,
     opts: Options,
     xlsx: XlsxState,
+    /// First free id for new drawings: above every `wp:docPr`/`pic:cNvPr`/`p:cNvPr` id in the template.
+    first_drawing_id: u32,
+}
+
+/// New drawing ids start here (as in the TS version) unless the template already uses higher ids.
+const DRAWING_ID_BASE: u32 = 0x7000;
+
+fn max_drawing_id(xml: &str) -> u32 {
+    crate::re!(r#"<(?:wp:docPr|pic:cNvPr|p:cNvPr)\b[^>]*\sid="(\d+)""#)
+        .captures_iter(xml)
+        .filter_map(|c| c[1].parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 impl Template {
@@ -38,8 +51,10 @@ impl Template {
         let mut xlsx = XlsxState::default();
         let mut compiled = Vec::new();
         let mut errors = Vec::new();
+        let mut first_drawing_id = DRAWING_ID_BASE;
         for part in format.template_parts(&pkg) {
             let mut xml = pkg.get_text(&part).unwrap_or_default();
+            first_drawing_id = first_drawing_id.max(max_drawing_id(&xml));
             if format == DocumentFormat::Xlsx {
                 xml = xlsx::preprocess(&pkg, &part, &xml, &mut xlsx, &opts.start);
             }
@@ -52,7 +67,7 @@ impl Template {
             return Err(Errors(errors));
         }
         xlsx.shared = None; // only needed while compiling
-        Ok(Template { format, pkg, compiled, opts, xlsx })
+        Ok(Template { format, pkg, compiled, opts, xlsx, first_drawing_id })
     }
 
     pub fn options(&self) -> &Options {
@@ -73,21 +88,26 @@ impl Template {
             part: String::new(),
             pkg: &mut pkg,
             host,
-            doc_pr: 0,
-            shape_id: 0,
+            doc_pr: self.first_drawing_id,
+            shape_id: self.first_drawing_id,
             loop_iterations: 0,
             host_calls: 0,
         };
+        let mut row_maps = Vec::new();
         for c in &self.compiled {
             ctx.part = c.part.clone();
             let mut xml = render_part(c, data, hooks, &mut ctx)?;
             if self.format == DocumentFormat::Xlsx {
-                xml = xlsx::postprocess(&xml, &c.part, &self.xlsx);
+                let (next, map) = xlsx::postprocess(&xml, &c.part, &self.xlsx);
+                xml = next;
+                if let Some(m) = map {
+                    row_maps.push((c.part.clone(), m));
+                }
             }
             ctx.pkg.set_text(&c.part, &xml);
         }
         if self.format == DocumentFormat::Xlsx {
-            xlsx::finalize(ctx.pkg);
+            xlsx::finalize(ctx.pkg, &row_maps);
         }
         pkg.to_bytes(&self.opts.limits)
     }

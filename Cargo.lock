@@ -65,6 +65,7 @@ name = "coffee-wasm"
 version = "0.1.0"
 dependencies = [
  "coffee-abi",
+ "coffee-core",
 ]
 
 [[package]]

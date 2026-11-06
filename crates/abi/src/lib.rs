@@ -314,6 +314,11 @@ impl Host for FrameHost<'_> {
     }
 }
 
+/// An error response frame (for transports that fail before reaching an instance).
+pub fn error_response(code: ErrorCode, message: &str) -> Vec<u8> {
+    error_frame(None, &Errors::from(Error::new(code, message))).encode()
+}
+
 /// Builds a request frame from JSON text and blobs (helper for hosts and tests).
 pub fn request(json: &str, blobs: Vec<Vec<u8>>) -> Vec<u8> {
     Frame::new(json, blobs).encode()

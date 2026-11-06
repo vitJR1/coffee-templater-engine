@@ -86,3 +86,44 @@ pub fn render_host(tpl: &[u8], json: &str, o: Options, host: &mut FnHost) -> Res
 }
 
 pub const PNG_2X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGP4z8DwnwEIGBgAHvAD/c5k+8YAAAAASUVORK5CYII=";
+
+/// Minimal workbook: `sheets` = (name, sheetData + following XML), plus extra files
+/// (e.g. tables) and extra workbook XML (e.g. definedNames).
+pub fn xlsx(sheets: &[(&str, &str)], workbook_extra: &str, extra: &[(&str, &str, &str)]) -> Vec<u8> {
+    let mut ct = String::from(
+        r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>"#,
+    );
+    let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+    let mut sheet_list = String::new();
+    let mut wb_rels =
+        String::from(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (i, (name, body)) in sheets.iter().enumerate() {
+        let n = i + 1;
+        sheet_list.push_str(&format!(r#"<sheet name="{name}" sheetId="{n}" r:id="rId{n}"/>"#));
+        wb_rels.push_str(&format!(r#"<Relationship Id="rId{n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{n}.xml"/>"#));
+        ct.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{n}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#));
+        files.push((format!("xl/worksheets/sheet{n}.xml"), format!(r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{body}</worksheet>"#)));
+    }
+    wb_rels.push_str("</Relationships>");
+    ct.push_str("</Types>");
+    let wb = format!(
+        r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_list}</sheets>{workbook_extra}</workbook>"#
+    );
+    let mut all: Vec<(String, String)> = vec![
+        ("[Content_Types].xml".into(), ct),
+        ("_rels/.rels".into(), rels.into()),
+        ("xl/workbook.xml".into(), wb),
+        ("xl/_rels/workbook.xml.rels".into(), wb_rels),
+    ];
+    all.extend(files);
+    for (path, _, content) in extra {
+        all.push((path.to_string(), content.to_string()));
+    }
+    zip::write(all.iter().map(|(k, v)| (k.as_str(), v.as_bytes()))).unwrap()
+}
+
+/// `<c r="A1" t="inlineStr"><is><t>text</t></is></c>`
+pub fn cell(r: &str, text: &str) -> String {
+    format!(r#"<c r="{r}" t="inlineStr"><is><t>{text}</t></is></c>"#)
+}

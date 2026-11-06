@@ -114,6 +114,7 @@ make conformance  # run the conformance cases against dist/coffee_core.wasm in N
 make capi         # → target/release/libcoffee_core_capi.{a,so,dylib}
 make schema       # regenerate schema/*.json
 make lint         # clippy + rustfmt
+cargo run -p coffee-core --release --example bench -- 10000   # render benchmark
 ```
 
 Every push to `main` builds the package in GitHub Actions (`package` workflow):

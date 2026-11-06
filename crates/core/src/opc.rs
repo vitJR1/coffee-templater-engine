@@ -6,6 +6,7 @@ use crate::xml::dom::parse_xml;
 use crate::xml::escape::escape_attr;
 use crate::zip;
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub mod rel {
@@ -39,6 +40,8 @@ pub struct Relationship {
 pub struct Package {
     files: IndexMap<String, Rc<[u8]>>,
     pub max_xml_depth: u64,
+    /// (crc32, len, media dir, extension) → media path of images added by `add_image`.
+    media_index: HashMap<(u32, usize, String, String), String>,
 }
 
 fn image_mime(ext: &str) -> String {
@@ -94,7 +97,7 @@ fn attr_in(raw: &str, name: &str) -> Option<String> {
 
 impl Package {
     pub fn new(files: IndexMap<String, Rc<[u8]>>) -> Self {
-        Package { files, max_xml_depth: Limits::default().max_xml_depth }
+        Package { files, max_xml_depth: Limits::default().max_xml_depth, media_index: HashMap::new() }
     }
 
     pub fn load(input: &[u8], limits: &Limits) -> Result<Package> {
@@ -109,7 +112,7 @@ impl Package {
         if !files.contains_key(CONTENT_TYPES) {
             return Err(Error::invalid_document("Input is not an OOXML package: [Content_Types].xml is missing"));
         }
-        Ok(Package { files, max_xml_depth: limits.max_xml_depth })
+        Ok(Package { files, max_xml_depth: limits.max_xml_depth, media_index: HashMap::new() })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -295,7 +298,7 @@ impl Package {
         if find_tags(&xml, "<Default").any(|(s, e)| xml[s..e].to_lowercase().contains(&needle)) {
             return;
         }
-        let add = format!("<Default Extension=\"{ext}\" ContentType=\"{}\"/></Types>", escape_attr(content_type));
+        let add = format!("<Default Extension=\"{}\" ContentType=\"{}\"/></Types>", escape_attr(&ext), escape_attr(content_type));
         self.set_text(CONTENT_TYPES, &xml.replacen("</Types>", &add, 1));
     }
 
@@ -319,19 +322,39 @@ impl Package {
     }
 
     /// Stores an image in `<media_dir>/` and links it from `part`. Returns the relationship id.
-    pub fn add_image(&mut self, part: &str, media_dir: &str, data: Rc<[u8]>, extension: &str) -> String {
+    ///
+    /// Identical images (same bytes and extension) are stored once, and a part that already links
+    /// to the stored file reuses its relationship.
+    pub fn add_image(&mut self, part: &str, media_dir: &str, data: Rc<[u8]>, extension: &str) -> Result<String> {
         let lower = extension.to_lowercase();
         let ext = if lower == "jpg" { "jpeg".to_string() } else { lower };
-        let mut n = 1;
-        while self.has(&format!("{media_dir}/image_ct{n}.{ext}")) {
-            n += 1;
+        if !crate::image::is_safe_extension(&ext) {
+            return Err(Error::new(crate::ErrorCode::InvalidImage, format!("Invalid image extension {ext:?}")));
         }
-        let media = format!("{media_dir}/image_ct{n}.{ext}");
-        self.files.insert(media.clone(), data);
-        self.ensure_default_content_type(&ext, &image_mime(&ext));
+        let key = (crc32fast::hash(&data), data.len(), media_dir.to_string(), ext.clone());
+        let existing = self.media_index.get(&key).filter(|m| self.files.get(*m).is_some_and(|b| b[..] == data[..])).cloned();
+        let media = match existing {
+            Some(m) => m,
+            None => {
+                let mut n = 1;
+                while self.has(&format!("{media_dir}/image_ct{n}.{ext}")) {
+                    n += 1;
+                }
+                let media = format!("{media_dir}/image_ct{n}.{ext}");
+                self.files.insert(media.clone(), data);
+                self.media_index.insert(key, media.clone());
+                self.ensure_default_content_type(&ext, &image_mime(&ext));
+                media
+            }
+        };
         let part_dir = part.rfind('/').map(|i| &part[..i]).unwrap_or("");
         let target = relative_path(part_dir, &media);
-        self.add_relationship(part, rel::IMAGE, &target, false)
+        if let Some(r) =
+            self.relationships(part).into_iter().find(|r| r.rel_type == rel::IMAGE && r.target == target && r.target_mode.is_none())
+        {
+            return Ok(r.id);
+        }
+        Ok(self.add_relationship(part, rel::IMAGE, &target, false))
     }
 }
 

@@ -196,7 +196,10 @@ formatting, declare a host filter named `currency`.
   aspect ratio; if both are missing, the natural size is used.
 - The format and natural size are detected for PNG, JPEG, GIF, BMP and SVG. Other formats need
   `extension`.
+- `extension` must be 1–10 letters or digits (`png`, `.JPG` are fine).
 - `null`, `false` or `""` removes the tag. In strict mode a missing value is an error.
+- The same image (same bytes and extension) used many times, for example in a loop, is stored once
+  in the package. New drawing ids continue after the highest id already present in the template.
 
 In **Word** the picture is inline, at the tag position. In **PowerPoint** the tag must be the
 content of a text box or placeholder: the shape is replaced by the picture, which is fitted
@@ -207,9 +210,17 @@ content of a text box or placeholder: the shape is replaced by the picture, whic
 
 - A cell holding only one tag whose value is a number, `$decimal` or boolean becomes a typed cell.
   Mixed text stays a string.
-- Row loops renumber the rows below them. Cell references in formulas, merged ranges, conditional
-  formatting, data validation and hyperlinks are shifted accordingly. Merges inside repeated rows
-  are duplicated.
+- Row loops renumber the rows below them. Copies of a looped row are contiguous; blank rows between
+  template rows are kept.
+- References follow the moved rows: formulas on every sheet (including `Sheet1!A5` and
+  `'My sheet'!A5` from other sheets), defined names (print areas, named ranges), tables and their
+  auto filters, the sheet's auto filter, merged ranges, conditional formatting, data validation and
+  hyperlinks. Merges inside repeated rows are duplicated.
+- Rows removed by an empty loop behave as if deleted in Excel: a reference to them becomes `#REF!`,
+  and a range is clamped to its remaining rows (`#REF!` when none remain). Merges, validations,
+  formatting and hyperlinks that covered only removed rows are dropped. Wrap totals over a loop that
+  may be empty in `IFERROR(…, 0)`.
+- A formula in a cell that receives a number or boolean is kept, with the value as its cached result.
 - `calcChain.xml` is removed and `fullCalcOnLoad="1"` is set, so Excel recalculates on open.
 - Shared strings containing tags are inlined into their cells.
 
@@ -503,8 +514,11 @@ callbacks are not supported. Header: [`crates/capi/include/coffee_core.h`](crate
   `FinalizationRegistry` plus an explicit `dispose()`.
 - For cancellation and timeouts, interrupt the WebAssembly instance (wazero
   `WithCloseOnContextDone`, wasmtime epoch interruption) and drop it from the pool.
-- A panic in the native build becomes an `internal` error. In WebAssembly it traps: drop the
-  instance.
+- A panic in the native build becomes an `internal` error, and the instance keeps working.
+- In WebAssembly a panic traps. A trap (including a host exception thrown from a callback) is
+  detected on the next `ct_call`: it answers `internal` once, resets the instance and drops its
+  templates. Wrappers should then recompile templates lazily, or simply replace the instance.
+  `ct_call` from inside a callback is answered with `invalid_request`.
 
 ---
 
@@ -531,7 +545,10 @@ Always on, not configurable:
 - Zip entries with absolute paths, `..`, backslashes, duplicate names, encryption, ZIP64 or a bad
   CRC are rejected (`invalid_document`).
 - Sizes are checked against the declared sizes before inflating, and inflation is capped.
+- XML nesting is capped at 1 024 levels even when `maxXmlDepth` is 0 or larger.
+- Template sections nest at most 128 levels deep (`limit_exceeded`, `details.limit = "sectionDepth"`).
 - JSON nesting in requests is limited to 128 levels.
+- Package entry names are validated when writing, too.
 
 ---
 
@@ -718,3 +735,9 @@ identical to it part for part. Intentional differences:
 - Unsafe zip entries are rejected. TS silently stripped a leading `/`.
 - Excel: a self-closing `<f t="shared" …/>` no longer merges with the next formula during row
   renumbering, which corrupted formulas in TS.
+- Excel: references to rows removed by an empty loop become `#REF!` (TS left them pointing at
+  whatever row moved into their place); copies of a looped row after a blank row are contiguous;
+  tables, defined names, auto filters and references from other sheets are updated; a formula in a
+  cell receiving a scalar value is kept (TS dropped it).
+- Images: identical images are stored once; extensions are validated; drawing ids don't collide
+  with ids already in the template.
