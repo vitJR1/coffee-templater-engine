@@ -6,7 +6,7 @@ use crate::opc::{rel, Package};
 use crate::template::engine::{FormatHooks, FormatSpec, ImageMode, RenderCtx, Tok, TokenContext, XmlKind};
 use crate::xml::dom::parse_xml;
 use crate::xml::escape::escape_attr;
-use crate::xml::tokenizer::raw_attr;
+use crate::xml::tokenizer::{find_tags, raw_attr};
 
 pub static SPEC: FormatSpec = FormatSpec {
     text_tags: &["a:t"],
@@ -89,17 +89,7 @@ struct Box_ {
 
 /// First `<tag ...>` (open or self-closing) in `xml`, as raw text.
 fn first_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let mut from = 0;
-    while let Some(p) = xml[from..].find(tag).map(|p| p + from) {
-        from = p + tag.len();
-        let next = xml.as_bytes().get(p + tag.len()).copied();
-        if !matches!(next, Some(c) if c.is_ascii_whitespace() || c == b'>' || c == b'/') {
-            continue;
-        }
-        let end = xml[p..].find('>')? + p + 1;
-        return Some(&xml[p..end]);
-    }
-    None
+    find_tags(xml, tag).next().map(|(s, e)| &xml[s..e])
 }
 
 /// `<p:spPr .../>` or `<p:spPr ...>...</p:spPr>`.
@@ -182,7 +172,7 @@ impl FormatHooks for Pptx {
         let id = match cnv.and_then(|t| raw_attr(t, "id")).filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())) {
             Some(v) => v.to_string(),
             None => {
-                ctx.shape_id += 1;
+                ctx.shape_id = ctx.shape_id.checked_add(1).unwrap_or(1);
                 ctx.shape_id.to_string()
             }
         };

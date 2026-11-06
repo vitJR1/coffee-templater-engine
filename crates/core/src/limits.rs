@@ -42,8 +42,9 @@ pub const RATIO_CHECK_THRESHOLD: u64 = MIB;
 pub const HARD_MAX_XML_DEPTH: u64 = 1024;
 
 /// Maximum nesting of template sections (`{{#a}}{{#b}}…`): compilation, rendering and inspection
-/// recurse once per level.
-pub const MAX_SECTION_DEPTH: usize = 128;
+/// recurse once per level, and the tag tree returned by `inspect` (two JSON levels per section)
+/// must stay within the 128-level JSON limit of common hosts.
+pub const MAX_SECTION_DEPTH: usize = 48;
 
 /// Effective XML depth limit.
 pub fn xml_depth(limit: u64) -> u64 {

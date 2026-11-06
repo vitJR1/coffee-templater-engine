@@ -17,9 +17,13 @@ pub struct ResolvedImage {
     pub alt: String,
 }
 
-/// File extensions used in package paths and content types: `[a-z0-9]{1,10}`.
+/// Image formats accepted in `extension` (lower case). Anything else is rejected: the value ends
+/// up in a package path and a content type, and names such as `rels` or `xml` would make the
+/// picture take over the content type of package parts.
+pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "svg", "webp", "emf", "wmf", "ico"];
+
 pub fn is_safe_extension(ext: &str) -> bool {
-    (1..=10).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    IMAGE_EXTENSIONS.contains(&ext)
 }
 
 pub fn is_image_value(v: &Value) -> bool {
@@ -61,7 +65,7 @@ pub fn resolve_image(value: &Value) -> Result<ResolvedImage, String> {
         return Err("Cannot detect image format; pass `extension`".into());
     }
     if !is_safe_extension(&extension) {
-        return Err(format!("Invalid image extension {extension:?}: expected 1-10 letters or digits"));
+        return Err(format!("Invalid image extension {extension:?}: expected one of {}", IMAGE_EXTENSIONS.join(", ")));
     }
     let natural = info.filter(|i| i.1 > 0.0 && i.2 > 0.0);
     let (w, h) = (opt_num(o.get("width")), opt_num(o.get("height")));

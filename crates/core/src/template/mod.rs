@@ -14,9 +14,11 @@ use crate::formats::DocumentFormat;
 use crate::host::Host;
 use crate::opc::Package;
 use crate::value::Value;
+use crate::xml::tokenizer::{find_local_tags, raw_attr, set_raw_attribute};
 use engine::{compile_part, inspect_nodes, render_part, CompiledPart, RenderCtx, TemplateTag};
 use options::Options;
 use serde_json::{json, Map, Value as SJson};
+use std::collections::HashSet;
 
 /// A parsed template, ready to be rendered many times.
 #[derive(Debug, Clone)]
@@ -26,19 +28,66 @@ pub struct Template {
     compiled: Vec<CompiledPart>,
     opts: Options,
     xlsx: XlsxState,
-    /// First free id for new drawings: above every `wp:docPr`/`pic:cNvPr`/`p:cNvPr` id in the template.
+    /// First id for new drawings: above every `docPr`/`cNvPr` id in the template (repeats are fixed
+    /// after rendering).
     first_drawing_id: u32,
 }
 
 /// New drawing ids start here (as in the TS version) unless the template already uses higher ids.
 const DRAWING_ID_BASE: u32 = 0x7000;
 
+/// Ids of every `docPr` / `cNvPr` element (any prefix) in `xml`.
+fn drawing_ids<'a>(xml: &'a str, local: &'a str) -> impl Iterator<Item = (usize, usize, Option<u32>)> + 'a {
+    find_local_tags(xml, local).map(|(s, e)| (s, e, raw_attr(&xml[s..e], "id").and_then(|v| v.trim().parse::<u32>().ok())))
+}
+
 fn max_drawing_id(xml: &str) -> u32 {
-    crate::re!(r#"<(?:wp:docPr|pic:cNvPr|p:cNvPr)\b[^>]*\sid="(\d+)""#)
-        .captures_iter(xml)
-        .filter_map(|c| c[1].parse::<u32>().ok())
-        .max()
-        .unwrap_or(0)
+    drawing_ids(xml, "docPr").chain(drawing_ids(xml, "cNvPr")).filter_map(|(_, _, id)| id).max().unwrap_or(0)
+}
+
+/// Gives a fresh id to every repeated `local` element id (drawings copied by loops) across the
+/// parts of one scope: the whole document for DOCX `docPr`, one slide for PPTX `cNvPr`.
+fn dedupe_drawing_ids(pkg: &mut Package, parts: &[&str], local: &str) {
+    let texts: Vec<(String, String)> = parts.iter().filter_map(|p| pkg.get_text(p).map(|x| (p.to_string(), x))).collect();
+    let mut used = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut duplicates = false;
+    for (_, xml) in &texts {
+        for (_, _, id) in drawing_ids(xml, local) {
+            if let Some(id) = id {
+                duplicates |= !seen.insert(id);
+                used.insert(id);
+            }
+        }
+    }
+    if !duplicates {
+        return;
+    }
+    let mut next = used.iter().max().copied().unwrap_or(0);
+    let mut fresh = || loop {
+        next = next.checked_add(1).unwrap_or(1);
+        if used.insert(next) {
+            return next;
+        }
+    };
+    let mut seen = HashSet::new();
+    for (part, xml) in texts {
+        let mut out = String::with_capacity(xml.len());
+        let mut last = 0;
+        for (s, e, id) in drawing_ids(&xml, local) {
+            let Some(id) = id else { continue };
+            if seen.insert(id) {
+                continue;
+            }
+            out.push_str(&xml[last..s]);
+            out.push_str(&set_raw_attribute(&xml[s..e], "id", &fresh().to_string()));
+            last = e;
+        }
+        if last > 0 {
+            out.push_str(&xml[last..]);
+            pkg.set_text(&part, &out);
+        }
+    }
 }
 
 impl Template {
@@ -54,9 +103,10 @@ impl Template {
         let mut first_drawing_id = DRAWING_ID_BASE;
         for part in format.template_parts(&pkg) {
             let mut xml = pkg.get_text(&part).unwrap_or_default();
-            first_drawing_id = first_drawing_id.max(max_drawing_id(&xml));
             if format == DocumentFormat::Xlsx {
                 xml = xlsx::preprocess(&pkg, &part, &xml, &mut xlsx, &opts.start);
+            } else {
+                first_drawing_id = first_drawing_id.max(max_drawing_id(&xml));
             }
             match compile_part(&xml, hooks, &opts, &part) {
                 Ok(c) => compiled.push(c),
@@ -106,8 +156,17 @@ impl Template {
             }
             ctx.pkg.set_text(&c.part, &xml);
         }
-        if self.format == DocumentFormat::Xlsx {
-            xlsx::finalize(ctx.pkg, &row_maps);
+        match self.format {
+            DocumentFormat::Xlsx => xlsx::finalize(ctx.pkg, &row_maps),
+            DocumentFormat::Docx => {
+                let parts: Vec<&str> = self.compiled.iter().map(|c| c.part.as_str()).collect();
+                dedupe_drawing_ids(ctx.pkg, &parts, "docPr");
+            }
+            DocumentFormat::Pptx => {
+                for c in &self.compiled {
+                    dedupe_drawing_ids(ctx.pkg, &[c.part.as_str()], "cNvPr");
+                }
+            }
         }
         pkg.to_bytes(&self.opts.limits)
     }
@@ -118,7 +177,7 @@ impl Template {
         let tags: Vec<TemplateTag> = parts.iter().flat_map(|(_, t)| t.clone()).collect();
         let mut variables: Vec<String> = Vec::new();
         let mut schema = Map::new();
-        collect(&tags, "", &mut schema, &mut variables);
+        collect(&tags, "", &mut schema, &mut variables, 0);
         InspectResult { format: self.format, parts, tags, variables, schema }
     }
 }
@@ -175,9 +234,13 @@ fn add_var(out: &mut Vec<String>, v: String) {
     }
 }
 
-/// Walks the tag tree and fills `schema` (sample data) and `out` (dotted paths).
-/// Returns true when any tag inside references data (including `{{.}}`).
-fn collect(tags: &[TemplateTag], prefix: &str, schema: &mut Map<String, SJson>, out: &mut Vec<String>) -> bool {
+/// The sample data shape stops growing below this depth, so the `inspect` response stays within
+/// the JSON nesting limits of hosts (often 128) whatever the paths look like.
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// Walks the tag tree and fills `schema` (sample data, `depth` levels below the root) and `out`
+/// (dotted paths). Returns true when any tag inside references data (including `{{.}}`).
+fn collect(tags: &[TemplateTag], prefix: &str, schema: &mut Map<String, SJson>, out: &mut Vec<String>, depth: usize) -> bool {
     let mut referenced = false;
     for t in tags {
         let (path, is_section) = match t {
@@ -201,7 +264,7 @@ fn collect(tags: &[TemplateTag], prefix: &str, schema: &mut Map<String, SJson>, 
                 continue;
             }
             add_var(out, full);
-            if get_path(schema, clean).is_none() {
+            if depth + split_path(clean).len() <= MAX_SCHEMA_DEPTH && get_path(schema, clean).is_none() {
                 let v = if matches!(t, TemplateTag::Image { .. }) { SJson::Null } else { SJson::String(String::new()) };
                 set_path(schema, clean, v);
             }
@@ -209,15 +272,17 @@ fn collect(tags: &[TemplateTag], prefix: &str, schema: &mut Map<String, SJson>, 
         }
         let TemplateTag::Section { mode, children, else_children, .. } = t else { continue };
         if path.is_empty() || is_local {
-            referenced = collect(children, prefix, schema, out) || referenced;
+            referenced = collect(children, prefix, schema, out, depth) || referenced;
         } else {
+            // the loop item sits one array level below the path
+            let item_depth = depth + split_path(clean).len() + 1;
             let mut child_schema = Map::new();
             let mut child_vars = Vec::new();
-            let child_refs = collect(children, "", &mut child_schema, &mut child_vars);
+            let child_refs = collect(children, "", &mut child_schema, &mut child_vars, item_depth);
             // {{#each x}} is always a loop; {{#x}} is treated as a loop when its body uses data.
             let is_loop = *mode == tags::SectionMode::Each || (*mode == tags::SectionMode::Section && child_refs);
             if is_loop {
-                if !is_self {
+                if !is_self && item_depth <= MAX_SCHEMA_DEPTH {
                     let item = if child_schema.is_empty() { SJson::String(String::new()) } else { SJson::Object(child_schema) };
                     set_path(schema, clean, SJson::Array(vec![item]));
                 }
@@ -230,16 +295,16 @@ fn collect(tags: &[TemplateTag], prefix: &str, schema: &mut Map<String, SJson>, 
             } else {
                 if !is_self {
                     add_var(out, full.clone());
-                    if get_path(schema, clean).is_none() {
+                    if item_depth <= MAX_SCHEMA_DEPTH && get_path(schema, clean).is_none() {
                         set_path(schema, clean, SJson::Bool(true));
                     }
                 }
                 // condition bodies share the outer scope
-                collect(children, prefix, schema, out);
+                collect(children, prefix, schema, out, depth);
             }
         }
         if let Some(e) = else_children {
-            referenced = collect(e, prefix, schema, out) || referenced;
+            referenced = collect(e, prefix, schema, out, depth) || referenced;
         }
     }
     referenced

@@ -78,9 +78,16 @@ struct WasmHost;
 
 impl HostTransport for WasmHost {
     fn call(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+        if STATE.get() == POISONED {
+            return None;
+        }
         STATE.set(IN_CALLBACK);
         // SAFETY: the request slice lives in module memory for the duration of the call.
         let ptr = unsafe { host_call(request.as_ptr() as usize as u32, request.len() as u32) };
+        if STATE.get() == POISONED {
+            // ct_call ran from inside the callback and poisoned the instance; stop this call too.
+            return None;
+        }
         STATE.set(BUSY);
         if ptr == 0 {
             return None;
@@ -96,16 +103,28 @@ impl HostTransport for WasmHost {
     }
 }
 
-// The module is single-threaded. A trap (panics abort on wasm32) can stop a call half way; the
-// state flag notices that on the next call, and the instance is replaced instead of being reused
-// in an unknown state.
+// The module is single-threaded. A trap (a panic, or a host exception thrown from a callback)
+// stops a call half way and leaves the shadow stack and the heap of that call behind: neither
+// can be restored from inside the module. The state flag notices the trap on the next call and
+// poisons the instance for good; every later call answers `internal` and the host must create a
+// new WebAssembly instance. A `ct_call` made from inside a callback cannot be told apart from a
+// trapped callback, so it poisons the instance as well.
 const IDLE: u8 = 0;
 const BUSY: u8 = 1;
 const IN_CALLBACK: u8 = 2;
+const POISONED: u8 = 3;
+
+const POISONED_MESSAGE: &str = "The WebAssembly instance is unusable after a trap (a panic, a host exception thrown from a callback, \
+or ct_call made from inside a callback). Create a new instance.";
 
 thread_local! {
     static STATE: Cell<u8> = const { Cell::new(IDLE) };
     static INSTANCE: Cell<Option<Box<Instance>>> = const { Cell::new(None) };
+}
+
+fn poisoned() -> u32 {
+    STATE.set(POISONED);
+    to_prefixed(&error_response(ErrorCode::Internal, POISONED_MESSAGE))
 }
 
 /// Executes a request frame; returns a pointer to `[u32 frame_len][response frame]`.
@@ -114,34 +133,19 @@ thread_local! {
 /// `req_ptr..req_ptr+req_len` must be readable module memory (allocated with `ct_alloc`).
 #[no_mangle]
 pub unsafe extern "C" fn ct_call(req_ptr: u32, req_len: u32) -> u32 {
-    match STATE.get() {
-        IN_CALLBACK => {
-            // Either a re-entrant call from a host callback, or a callback that trapped (a host
-            // exception unwound through the module). Both are reported once; the state is reset.
-            // This is safe in both cases: a running call owns its instance (it was taken out).
-            STATE.set(IDLE);
-            let r = error_response(
-                ErrorCode::InvalidRequest,
-                "ct_call was called from a host callback, or a host callback trapped; the instance was reset",
-            );
-            return to_prefixed(&r);
-        }
-        BUSY => {
-            // The previous call trapped. Its instance may be inconsistent: leak it, start over.
-            std::mem::forget(INSTANCE.take());
-            STATE.set(IDLE);
-            let r = error_response(
-                ErrorCode::Internal,
-                "The previous call trapped; the instance was reset and its templates were dropped. Recompile them.",
-            );
-            return to_prefixed(&r);
-        }
-        _ => {}
+    if STATE.get() != IDLE {
+        // BUSY: the previous call trapped. IN_CALLBACK: a re-entrant call, or a trapped callback.
+        return poisoned();
     }
     STATE.set(BUSY);
     let request = if req_len == 0 { &[][..] } else { std::slice::from_raw_parts(req_ptr as usize as *const u8, req_len as usize) };
     let mut instance = INSTANCE.take().unwrap_or_else(|| Box::new(Instance::new(Box::new(WasmHost))));
     let response = instance.call(request);
+    if STATE.get() == POISONED {
+        // a re-entrant call happened during this one: drop the result, keep the instance dead
+        std::mem::forget(instance);
+        return poisoned();
+    }
     INSTANCE.set(Some(instance));
     STATE.set(IDLE);
     to_prefixed(&response)

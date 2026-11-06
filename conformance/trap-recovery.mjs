@@ -1,56 +1,69 @@
-// A host exception thrown from a callback unwinds through the module (a trap). The next ct_call
-// must report it once and then work normally on a fresh instance.
+// A trap (a host exception thrown from a callback, a panic) cannot be cleaned up inside the
+// module, so the instance is poisoned: every later ct_call answers `internal`, and a new instance
+// works normally. A ct_call made from inside a callback poisons the instance too.
 //
 //     node conformance/trap-recovery.mjs [path/to/coffee_core.wasm]
 
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { Core } from './core.mjs'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
-const wasm = readFileSync(process.argv[2] ?? join(ROOT, '..', 'dist', 'coffee_core.wasm'))
-const enc = new TextEncoder()
-const dec = new TextDecoder()
-
-let ex
-const { instance } = await WebAssembly.instantiate(wasm, { ct_host: { call: () => { throw new Error('host exploded') } } })
-ex = instance.exports
-
-function frame(json, blobs = []) {
-  const j = enc.encode(JSON.stringify(json))
-  const out = new Uint8Array(12 + j.length + blobs.reduce((n, b) => n + 4 + b.length, 0))
-  const dv = new DataView(out.buffer)
-  out.set(enc.encode('CTF1'))
-  dv.setUint32(4, j.length, true)
-  out.set(j, 8)
-  let p = 8 + j.length
-  dv.setUint32(p, blobs.length, true)
-  p += 4
-  for (const b of blobs) { dv.setUint32(p, b.length, true); out.set(b, p + 4); p += 4 + b.length }
-  return out
-}
-
-function call(json, blobs) {
-  const req = frame(json, blobs)
-  const ptr = ex.ct_alloc(req.length)
-  new Uint8Array(ex.memory.buffer, ptr, req.length).set(req)
-  const res = ex.ct_call(ptr, req.length)
-  const len = new DataView(ex.memory.buffer).getUint32(res, true)
-  const f = new Uint8Array(ex.memory.buffer, res + 4, len).slice()
-  ex.ct_free(res, len + 4)
-  const jl = new DataView(f.buffer).getUint32(4, true)
-  return JSON.parse(dec.decode(f.subarray(8, 8 + jl)))
-}
-
+const module = new WebAssembly.Module(readFileSync(process.argv[2] ?? join(ROOT, '..', 'dist', 'coffee_core.wasm')))
 const tpl = readFileSync(join(ROOT, 'fixtures', 'invoice.docx'))
-let threw = false
-try {
-  call({ op: 'renderOnce', template: { $blob: 0 }, options: { hostFilters: ['number'] }, data: { items: [{ price: 1 }] } }, [tpl])
-} catch (e) {
-  threw = e.message === 'host exploded'
+const render = (core) =>
+  core.call({ op: 'renderOnce', template: { $blob: 0 }, options: { hostFilters: ['number'] }, data: { items: [{ price: 1 }] } }, [tpl])
+const code = (res) => res.json.errors?.[0]?.code
+
+let failed = 0
+function check(name, ok, info) {
+  if (!ok) failed++
+  console.log(ok ? `ok    ${name}` : `FAIL  ${name}: ${JSON.stringify(info)}`)
 }
-const after = call({ op: 'info' })
-const again = call({ op: 'info' })
-const ok = threw && after.ok === false && again.ok === true && again.result.abiVersion === 1
-console.log(ok ? 'ok    trap recovery' : `FAIL  trap recovery: ${JSON.stringify({ threw, after, again })}`)
-process.exit(ok ? 0 : 1)
+
+// 1. a host exception unwinds through the module
+{
+  const core = new Core(module, () => {
+    throw new Error('host exploded')
+  })
+  let threw = false
+  try {
+    render(core)
+  } catch (e) {
+    threw = e.message === 'host exploded'
+  }
+  const after = [0, 1, 2].map(() => code(core.call({ op: 'info' })))
+  check('trap poisons the instance', threw && after.every((c) => c === 'internal'), { threw, after })
+}
+
+// 2. many traps on fresh instances: no state leaks between instances
+{
+  let ok = true
+  for (let i = 0; i < 300 && ok; i++) {
+    const core = new Core(module, () => {
+      throw new Error('boom')
+    })
+    try {
+      render(core)
+      ok = false
+    } catch {}
+    ok &&= code(core.call({ op: 'info' })) === 'internal'
+  }
+  const fresh = new Core(module).call({ op: 'info' }).json
+  check('a new instance works after a trap', ok && fresh.ok === true && fresh.result.abiVersion === 1, { ok, fresh })
+}
+
+// 3. ct_call from inside a callback
+{
+  let inner
+  const core = new Core(module, () => {
+    inner = code(core.call({ op: 'info' }))
+    return { json: { ok: true, value: 'x' } }
+  })
+  const outer = code(render(core))
+  const later = code(core.call({ op: 'info' }))
+  check('re-entrant ct_call poisons the instance', inner === 'internal' && outer === 'internal' && later === 'internal', { inner, outer, later })
+}
+
+process.exit(failed ? 1 : 0)

@@ -9,93 +9,13 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inflateRawSync } from 'node:zlib'
+import { Core } from './core.mjs'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
 const WASM = process.argv[2] ?? join(ROOT, '..', 'dist', 'coffee_core.wasm')
 
-// ------------------------------------------------------------------------------- frames
-
-const enc = new TextEncoder()
-const dec = new TextDecoder()
-
-function encodeFrame(json, blobs = []) {
-  const j = enc.encode(typeof json === 'string' ? json : JSON.stringify(json))
-  const size = 12 + j.length + blobs.reduce((n, b) => n + 4 + b.length, 0)
-  const out = new Uint8Array(size)
-  const dv = new DataView(out.buffer)
-  out.set(enc.encode('CTF1'), 0)
-  dv.setUint32(4, j.length, true)
-  out.set(j, 8)
-  let p = 8 + j.length
-  dv.setUint32(p, blobs.length, true)
-  p += 4
-  for (const b of blobs) {
-    dv.setUint32(p, b.length, true)
-    out.set(b, p + 4)
-    p += 4 + b.length
-  }
-  return out
-}
-
-function decodeFrame(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
-  if (dec.decode(buf.subarray(0, 4)) !== 'CTF1') throw new Error('bad frame magic')
-  const jl = dv.getUint32(4, true)
-  const json = JSON.parse(dec.decode(buf.subarray(8, 8 + jl)))
-  let p = 8 + jl
-  const n = dv.getUint32(p, true)
-  p += 4
-  const blobs = []
-  for (let i = 0; i < n; i++) {
-    const l = dv.getUint32(p, true)
-    blobs.push(buf.slice(p + 4, p + 4 + l))
-    p += 4 + l
-  }
-  return { json, blobs }
-}
-
-// ------------------------------------------------------------------------------- the core
-
 const module = new WebAssembly.Module(readFileSync(WASM))
-
-class Core {
-  constructor(onCall = () => null) {
-    const self = this
-    this.instance = new WebAssembly.Instance(module, {
-      ct_host: {
-        call(ptr, len) {
-          const req = decodeFrame(self.bytes(ptr, len).slice())
-          const res = onCall(req.json, req.blobs)
-          if (!res) return 0
-          const frame = encodeFrame(res.json, res.blobs)
-          // [u32 len][frame], allocated with ct_alloc; the core frees it
-          const out = self.ex.ct_alloc(frame.length + 4)
-          new DataView(self.ex.memory.buffer).setUint32(out, frame.length, true)
-          self.bytes(out + 4, frame.length).set(frame)
-          return out
-        },
-      },
-    })
-    this.ex = this.instance.exports
-    if (this.ex.ct_abi_version() !== 1) throw new Error('unsupported ABI')
-  }
-
-  bytes(ptr, len) {
-    return new Uint8Array(this.ex.memory.buffer, ptr, len)
-  }
-
-  call(json, blobs = []) {
-    const req = encodeFrame(json, blobs)
-    const ptr = this.ex.ct_alloc(req.length)
-    this.bytes(ptr, req.length).set(req)
-    const res = this.ex.ct_call(ptr, req.length)
-    this.ex.ct_free(ptr, req.length)
-    const len = new DataView(this.ex.memory.buffer).getUint32(res, true)
-    const frame = this.bytes(res + 4, len).slice()
-    this.ex.ct_free(res, len + 4)
-    return decodeFrame(frame)
-  }
-}
+const dec = new TextDecoder()
 
 // ------------------------------------------------------------------------------- helpers
 
@@ -170,7 +90,7 @@ function hostFor(filters) {
 function runCase(dir, name) {
   const c = JSON.parse(readFileSync(join(dir, 'case.json'), 'utf8'))
   const expect = c.expect
-  const core = new Core(hostFor(c.hostFilters ?? {}))
+  const core = new Core(module, hostFor(c.hostFilters ?? {}))
   const template = c.template ? readFileSync(join(ROOT, c.template)) : undefined
   const data = existsSync(join(dir, 'data.json')) ? readFileSync(join(dir, 'data.json'), 'utf8') : JSON.stringify(c.data ?? {})
   const blobDir = join(dir, 'blobs')
@@ -202,10 +122,10 @@ function runCase(dir, name) {
   if (c.op !== 'render') return
 
   const doc = res.blobs[0]
-  const text = () => new Core().call({ op: 'extractText', document: { $blob: 0 } }, [doc]).json.result.text
+  const text = () => new Core(module).call({ op: 'extractText', document: { $blob: 0 } }, [doc]).json.result.text
   if (expect.text !== undefined) assert(text() === expect.text, `text:\n${text()}`)
   for (const s of expect.textContains ?? []) assert(text().includes(s), `text does not contain ${JSON.stringify(s)}`)
-  if (expect.model) checkPaths(new Core().call({ op: 'parse', document: { $blob: 0 } }, [doc]).json.result.model, expect.model, 'model')
+  if (expect.model) checkPaths(new Core(module).call({ op: 'parse', document: { $blob: 0 } }, [doc]).json.result.model, expect.model, 'model')
   const files = unzip(doc)
   for (const [part, chk] of Object.entries(expect.parts ?? {})) {
     const xml = dec.decode(files.get(part))

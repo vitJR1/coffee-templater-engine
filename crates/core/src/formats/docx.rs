@@ -50,7 +50,7 @@ impl FormatHooks for Docx {
     fn render_image(&self, img: &ResolvedImage, ctx: &mut RenderCtx, _shape: Option<&str>) -> Result<String> {
         let part = ctx.part.clone();
         let r_id = ctx.pkg.add_image(&part, "word/media", img.data.clone(), &img.extension)?;
-        ctx.doc_pr += 1;
+        ctx.doc_pr = ctx.doc_pr.checked_add(1).unwrap_or(1); // repeats are renumbered after rendering
         let id = ctx.doc_pr;
         let cx = (img.width * EMU_PER_PX).round() as i64;
         let cy = (img.height * EMU_PER_PX).round() as i64;

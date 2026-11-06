@@ -196,6 +196,101 @@ pub fn remove_raw_attribute(raw: &str, name: &str) -> String {
     }
 }
 
+/// End (exclusive) of the tag that starts with `<` at `start`; `>` inside quoted attribute values
+/// does not end it.
+pub fn tag_end(xml: &str, start: usize) -> Option<usize> {
+    let b = xml.as_bytes();
+    let mut i = start + 1;
+    let mut quote = 0u8;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = c;
+        } else if c == b'>' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte ranges `(start, end)` of every `<tag ...>` / `<tag .../>` in `xml` (`tag` includes the
+/// `<`; the name must be followed by whitespace, `>` or `/`). Quote-aware.
+pub fn find_tags<'a>(xml: &'a str, tag: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let b = xml.as_bytes();
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(p) = xml[from..].find(tag).map(|p| p + from) {
+            from = p + tag.len();
+            if !matches!(b.get(p + tag.len()), Some(c) if c.is_ascii_whitespace() || *c == b'>' || *c == b'/') {
+                continue;
+            }
+            let end = tag_end(xml, p)?;
+            from = end;
+            return Some((p, end));
+        }
+        None
+    })
+}
+
+/// Like [`find_tags`], for every element whose local name (after any prefix) is `local`.
+pub fn find_local_tags<'a>(xml: &'a str, local: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let b = xml.as_bytes();
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(p) = xml[from..].find(local).map(|p| p + from) {
+            from = p + local.len();
+            if !matches!(b.get(p + local.len()), Some(c) if c.is_ascii_whitespace() || *c == b'>' || *c == b'/') {
+                continue;
+            }
+            // walk back over the prefix to the `<`
+            let mut s = p;
+            if s > 0 && b[s - 1] == b':' {
+                s -= 1;
+                while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_' || b[s - 1] == b'-' || b[s - 1] == b'.') {
+                    s -= 1;
+                }
+            }
+            if s == 0 || b[s - 1] != b'<' {
+                continue;
+            }
+            let end = tag_end(xml, s - 1)?;
+            from = end;
+            return Some((s - 1, end));
+        }
+        None
+    })
+}
+
+/// End (exclusive) of the element whose open tag spans `start..open_end`: the open tag itself
+/// when self-closing, else just past the matching `</name>` (same-name nesting is counted).
+pub fn element_end(xml: &str, start: usize, open_end: usize) -> Option<usize> {
+    if xml[..open_end].ends_with("/>") {
+        return Some(open_end);
+    }
+    let name_end = xml[start + 1..open_end].find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')? + start + 1;
+    let name = &xml[start + 1..name_end];
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut depth = 1;
+    let mut i = open_end;
+    while depth > 0 {
+        let c = xml[i..].find(&close)? + i;
+        for (_, e) in find_tags(&xml[i..c], &open) {
+            if !xml[i..i + e].ends_with("/>") {
+                depth += 1;
+            }
+        }
+        depth -= 1;
+        i = c + close.len();
+    }
+    Some(i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

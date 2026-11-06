@@ -105,17 +105,34 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # push to main: rolling pre-release "nightly", recreated on the current commit
+      # push to main: rolling pre-release "nightly", recreated on the current commit. Builds finish
+      # out of order (and re-runs keep their old commit), so only the tip of main may publish.
       - name: Publish nightly
         if: github.ref == 'refs/heads/main'
         run: |
-          gh release delete nightly --cleanup-tag --yes || true
+          tip=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "main is at $tip, not $GITHUB_SHA: a newer build publishes nightly"
+            exit 0
+          fi
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release delete nightly --cleanup-tag --yes
+          fi
+          # a tag left without its release would keep pointing at an old commit
+          if gh api "repos/$GH_REPO/git/ref/tags/nightly" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/nightly"
+          fi
           gh release create nightly dist/* \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Nightly (${GITHUB_SHA::7})" \
             --notes "Built from ${GITHUB_SHA} on main. Not a stable release: use a v* release for production."
-      # tag v*: versioned release
+      # tag v*: versioned release; a release already created in the UI gets the files attached
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          fi

@@ -335,7 +335,8 @@ fn compute_ranges(
             ParsedTag::Open(t) => {
                 open.push((i, None));
                 if open.len() > MAX_SECTION_DEPTH {
-                    return Err(vec![Error::limit("sectionDepth", MAX_SECTION_DEPTH as u64).with_part(part).with_tag(&t.raw)]);
+                    errors.push(Error::limit("sectionDepth", MAX_SECTION_DEPTH as u64).with_part(part).with_tag(&t.raw));
+                    return Err(errors);
                 }
             }
             ParsedTag::Else { raw } => match open.last_mut() {

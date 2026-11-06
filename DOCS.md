@@ -196,10 +196,12 @@ formatting, declare a host filter named `currency`.
   aspect ratio; if both are missing, the natural size is used.
 - The format and natural size are detected for PNG, JPEG, GIF, BMP and SVG. Other formats need
   `extension`.
-- `extension` must be 1–10 letters or digits (`png`, `.JPG` are fine).
+- `extension` must name an image format: `png`, `jpg`/`jpeg`, `gif`, `bmp`, `tif`/`tiff`, `svg`,
+  `webp`, `emf`, `wmf` or `ico` (case and a leading dot are ignored).
 - `null`, `false` or `""` removes the tag. In strict mode a missing value is an error.
 - The same image (same bytes and extension) used many times, for example in a loop, is stored once
-  in the package. New drawing ids continue after the highest id already present in the template.
+  in the package. New drawing ids continue after the highest id already present in the template,
+  and drawings repeated by a loop get fresh ids, so ids stay unique.
 
 In **Word** the picture is inline, at the tag position. In **PowerPoint** the tag must be the
 content of a text box or placeholder: the shape is replaced by the picture, which is fitted
@@ -211,15 +213,27 @@ content of a text box or placeholder: the shape is replaced by the picture, whic
 - A cell holding only one tag whose value is a number, `$decimal` or boolean becomes a typed cell.
   Mixed text stays a string.
 - Row loops renumber the rows below them. Copies of a looped row are contiguous; blank rows between
-  template rows are kept.
-- References follow the moved rows: formulas on every sheet (including `Sheet1!A5` and
-  `'My sheet'!A5` from other sheets), defined names (print areas, named ranges), tables and their
-  auto filters, the sheet's auto filter, merged ranges, conditional formatting, data validation and
-  hyperlinks. Merges inside repeated rows are duplicated.
+  template rows are kept. A loop body may span several rows; each copy keeps its own block.
+- References follow the moved rows, as when rows are inserted or deleted in Excel: formulas on
+  every sheet (`A5`, `5:5`, `Sheet1!A5`, `'My sheet'!A5`), defined names (print areas, print
+  titles, named ranges), tables (range, auto filter, sort state), the sheet's auto filter and sort
+  state, merged ranges, conditional formatting and data validation (ranges and formulas, including
+  the x14 extensions), hyperlinks (cells and `location`), page breaks, ignored errors, protected
+  ranges, cell comments and their VML notes, drawing anchors and chart series.
+- Inside a repeated row, a reference to the same row (or to another row of the same repeated block)
+  points to the same copy; merges and one-cell ranges of conditional formatting and validation
+  (`sqref="B3"`) are duplicated over all copies. References from outside a loop to a looped row
+  cover every copy when they are ranges, and the first copy otherwise.
+- Shared formulas (`<f t="shared">`) that touch a repeated row are written out as ordinary formulas.
+- References to other workbooks (`[1]Data!A5`), 3D references (`S1:S3!A5`), structured references
+  (`Table1[Col]`) and names are left as they are. Ranges that end on the last row of the sheet
+  (`A2:A1048576`) keep ending there.
 - Rows removed by an empty loop behave as if deleted in Excel: a reference to them becomes `#REF!`,
   and a range is clamped to its remaining rows (`#REF!` when none remain). Merges, validations,
-  formatting and hyperlinks that covered only removed rows are dropped. Wrap totals over a loop that
-  may be empty in `IFERROR(…, 0)`.
+  formatting, hyperlinks, comments, page breaks and auto filters that covered only removed rows are
+  dropped, and so is a table whose rows are all gone. A table left without data rows keeps one
+  (Excel does not open tables without data rows). Wrap totals over a loop that may be empty in
+  `IFERROR(…, 0)`.
 - A formula in a cell that receives a number or boolean is kept, with the value as its cached result.
 - `calcChain.xml` is removed and `fullCalcOnLoad="1"` is set, so Excel recalculates on open.
 - Shared strings containing tags are inlined into their cells.
@@ -515,10 +529,14 @@ callbacks are not supported. Header: [`crates/capi/include/coffee_core.h`](crate
 - For cancellation and timeouts, interrupt the WebAssembly instance (wazero
   `WithCloseOnContextDone`, wasmtime epoch interruption) and drop it from the pool.
 - A panic in the native build becomes an `internal` error, and the instance keeps working.
-- In WebAssembly a panic traps. A trap (including a host exception thrown from a callback) is
-  detected on the next `ct_call`: it answers `internal` once, resets the instance and drops its
-  templates. Wrappers should then recompile templates lazily, or simply replace the instance.
-  `ct_call` from inside a callback is answered with `invalid_request`.
+- In WebAssembly a panic traps, and so does a host exception thrown from a callback. A trap
+  cannot be cleaned up inside the module (the shadow stack and the heap of the interrupted call
+  stay behind), so the instance is **poisoned**: every later `ct_call` answers `internal`.
+  Drop the WebAssembly instance and create a new one; its templates are gone and must be
+  recompiled. Wrappers should catch exceptions in their callback code and answer with
+  `{"ok": false, "message": …}` instead of letting them escape.
+- `ct_call` must not be called from inside a callback. Such a call cannot be told apart from a
+  trapped callback, so it poisons the instance as well.
 
 ---
 
@@ -546,8 +564,10 @@ Always on, not configurable:
   CRC are rejected (`invalid_document`).
 - Sizes are checked against the declared sizes before inflating, and inflation is capped.
 - XML nesting is capped at 1 024 levels even when `maxXmlDepth` is 0 or larger.
-- Template sections nest at most 128 levels deep (`limit_exceeded`, `details.limit = "sectionDepth"`).
-- JSON nesting in requests is limited to 128 levels.
+- Template sections nest at most 48 levels deep (`limit_exceeded`, `details.limit = "sectionDepth"`).
+- JSON nesting in requests is limited to 128 levels. A model of a very deeply nested document
+  (about 20 tables nested in each other) can therefore come out of `parse` but not go back into
+  `build`.
 - Package entry names are validated when writing, too.
 
 ---
@@ -739,5 +759,8 @@ identical to it part for part. Intentional differences:
   whatever row moved into their place); copies of a looped row after a blank row are contiguous;
   tables, defined names, auto filters and references from other sheets are updated; a formula in a
   cell receiving a scalar value is kept (TS dropped it).
-- Images: identical images are stored once; extensions are validated; drawing ids don't collide
-  with ids already in the template.
+- Excel: blank rows next to a removed loop row, multi-row loop blocks, shared formulas in loop rows,
+  sheet names that look like cells (`'Q4 Data'!A:A`), structured references and many more parts
+  of the workbook (see [Excel specifics](#excel-specifics)) are handled; TS shifted or skipped them.
+- Images: identical images are stored once; extensions must be image formats; drawing ids are
+  unique, including drawings repeated by loops.

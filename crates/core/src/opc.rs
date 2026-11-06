@@ -42,6 +42,8 @@ pub struct Package {
     pub max_xml_depth: u64,
     /// (crc32, len, media dir, extension) → media path of images added by `add_image`.
     media_index: HashMap<(u32, usize, String, String), String>,
+    /// Media added from a given buffer (address of the `Rc` data); checked with `Rc::ptr_eq`.
+    media_by_ptr: HashMap<(usize, String, String), String>,
 }
 
 fn image_mime(ext: &str) -> String {
@@ -50,7 +52,8 @@ fn image_mime(ext: &str) -> String {
         "jpeg" | "jpg" => "image/jpeg".into(),
         "gif" => "image/gif".into(),
         "bmp" => "image/bmp".into(),
-        "tiff" => "image/tiff".into(),
+        "tiff" | "tif" => "image/tiff".into(),
+        "ico" => "image/x-icon".into(),
         "svg" => "image/svg+xml".into(),
         "webp" => "image/webp".into(),
         "emf" => "image/x-emf".into(),
@@ -59,24 +62,7 @@ fn image_mime(ext: &str) -> String {
     }
 }
 
-/// Finds `<{tag}` followed by a non-name character, returns the byte range of the whole tag up to
-/// and including the next `>`.
-fn find_tags<'a>(xml: &'a str, tag: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
-    let mut from = 0;
-    std::iter::from_fn(move || {
-        while let Some(p) = xml[from..].find(tag).map(|p| p + from) {
-            let after = xml.as_bytes().get(p + tag.len()).copied();
-            from = p + tag.len();
-            if matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b':' || c == b'-' || c == b'.') {
-                continue;
-            }
-            let end = xml[p..].find('>')? + p + 1;
-            from = end;
-            return Some((p, end));
-        }
-        None
-    })
-}
+use crate::xml::tokenizer::find_tags;
 
 /// Value of `name="..."` inside a raw tag, where `name` is preceded by a non-word character.
 fn attr_in(raw: &str, name: &str) -> Option<String> {
@@ -97,7 +83,7 @@ fn attr_in(raw: &str, name: &str) -> Option<String> {
 
 impl Package {
     pub fn new(files: IndexMap<String, Rc<[u8]>>) -> Self {
-        Package { files, max_xml_depth: Limits::default().max_xml_depth, media_index: HashMap::new() }
+        Package { files, max_xml_depth: Limits::default().max_xml_depth, media_index: HashMap::new(), media_by_ptr: HashMap::new() }
     }
 
     pub fn load(input: &[u8], limits: &Limits) -> Result<Package> {
@@ -112,7 +98,7 @@ impl Package {
         if !files.contains_key(CONTENT_TYPES) {
             return Err(Error::invalid_document("Input is not an OOXML package: [Content_Types].xml is missing"));
         }
-        Ok(Package { files, max_xml_depth: limits.max_xml_depth, media_index: HashMap::new() })
+        Ok(Package { files, max_xml_depth: limits.max_xml_depth, media_index: HashMap::new(), media_by_ptr: HashMap::new() })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -331,8 +317,12 @@ impl Package {
         if !crate::image::is_safe_extension(&ext) {
             return Err(Error::new(crate::ErrorCode::InvalidImage, format!("Invalid image extension {ext:?}")));
         }
+        // the same value used again (an image in a loop): no hashing, no byte comparison
+        let same = self.media_by_ptr.get(&(Rc::as_ptr(&data) as *const u8 as usize, media_dir.to_string(), ext.clone()));
+        let existing = same.filter(|m| self.files.get(*m).is_some_and(|b| Rc::ptr_eq(b, &data))).cloned();
         let key = (crc32fast::hash(&data), data.len(), media_dir.to_string(), ext.clone());
-        let existing = self.media_index.get(&key).filter(|m| self.files.get(*m).is_some_and(|b| b[..] == data[..])).cloned();
+        let existing =
+            existing.or_else(|| self.media_index.get(&key).filter(|m| self.files.get(*m).is_some_and(|b| b[..] == data[..])).cloned());
         let media = match existing {
             Some(m) => m,
             None => {
@@ -341,10 +331,13 @@ impl Package {
                     n += 1;
                 }
                 let media = format!("{media_dir}/image_ct{n}.{ext}");
+                self.media_by_ptr.insert((Rc::as_ptr(&data) as *const u8 as usize, media_dir.to_string(), ext.clone()), media.clone());
                 self.files.insert(media.clone(), data);
                 self.media_index.insert(key, media.clone());
                 self.ensure_default_content_type(&ext, &image_mime(&ext));
-                media
+                // a new file cannot be referenced yet
+                let target = relative_path(part.rfind('/').map(|i| &part[..i]).unwrap_or(""), &media);
+                return Ok(self.add_relationship(part, rel::IMAGE, &target, false));
             }
         };
         let part_dir = part.rfind('/').map(|i| &part[..i]).unwrap_or("");
