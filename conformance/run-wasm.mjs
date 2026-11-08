@@ -1,6 +1,6 @@
-// Runs the conformance cases against dist/coffee_core.wasm from Node.js — a minimal JS host:
-// frames, memory management (ct_alloc/ct_free), the ct_host.call import and declarative host
-// filters. sha256 values must match the ones produced by the Rust runner (spec §11–12).
+// Runs the conformance cases against dist/coffee_core.wasm from Node.js, with the host from
+// core.mjs (frames, ct_alloc/ct_free, the ct_host.call import) and declarative host filters.
+// sha256 values must match the ones produced by the Rust runner (spec §11–12).
 //
 //     node conformance/run-wasm.mjs [path/to/coffee_core.wasm]
 

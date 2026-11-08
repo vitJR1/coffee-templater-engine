@@ -332,82 +332,10 @@ fn parse_cell(
     Some(cell)
 }
 
-/// Shifts relative references of a formula (used to expand shared formulas).
+/// Shifts relative references of a formula (used to expand shared formulas). The same tokenizer
+/// as row renumbering: sheet names, structured references and strings are not references.
 pub fn shift_formula(formula: &str, d_row: i64, d_col: i64) -> String {
-    let mut out = String::new();
-    let mut in_str = false;
-    let mut seg = String::new();
-    let flush = |seg: &mut String, out: &mut String| {
-        out.push_str(&shift_refs(seg, d_row, d_col));
-        seg.clear();
-    };
-    for c in formula.chars() {
-        if c == '"' {
-            if in_str {
-                out.push('"');
-                in_str = false;
-                continue;
-            }
-            flush(&mut seg, &mut out);
-            in_str = true;
-            out.push('"');
-            continue;
-        }
-        if in_str {
-            out.push(c);
-        } else {
-            seg.push(c);
-        }
-    }
-    flush(&mut seg, &mut out);
-    out
-}
-
-fn shift_refs(s: &str, d_row: i64, d_col: i64) -> String {
-    let b = s.as_bytes();
-    let mut out = String::new();
-    let mut i = 0;
-    let mut last = 0;
-    while i < b.len() {
-        let pre_ok = i == 0 || !matches!(b[i - 1], c if c.is_ascii_alphanumeric() || c == b'_' || c == b'.');
-        if pre_ok {
-            let mut k = i;
-            let dc = b.get(k) == Some(&b'$');
-            if dc {
-                k += 1;
-            }
-            let ls = k;
-            while k < b.len() && b[k].is_ascii_uppercase() {
-                k += 1;
-            }
-            let le = k;
-            let dr = b.get(k) == Some(&b'$');
-            if dr {
-                k += 1;
-            }
-            let ds = k;
-            while k < b.len() && b[k].is_ascii_digit() {
-                k += 1;
-            }
-            let ok = (1..=3).contains(&(le - ls))
-                && k > ds
-                && !matches!(b.get(k), Some(c) if c.is_ascii_alphanumeric() || *c == b'_' || *c == b'(');
-            if ok {
-                out.push_str(&s[last..i]);
-                let col = &s[ls..le];
-                let row = &s[ds..k];
-                let new_col = if dc { col.to_string() } else { index_to_column((column_to_index(col) as i64 + d_col).max(1) as u32) };
-                let new_row = if dr { row.to_string() } else { (row.parse::<i64>().unwrap_or(0) + d_row).to_string() };
-                out.push_str(&format!("{}{}{}{}", if dc { "$" } else { "" }, new_col, if dr { "$" } else { "" }, new_row));
-                i = k;
-                last = k;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.push_str(&s[last..]);
-    out
+    crate::formats::xlsx::shift_formula(formula, d_row, d_col)
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -55,9 +55,10 @@ std::fs::write("invoice-42.docx", docx)?;
 ### From any language via WebAssembly
 
 ```js
-// Node.js, no dependencies. callCore() is the ~30-line frame helper from conformance/run-wasm.mjs
-const { instance } = await WebAssembly.instantiate(wasmBytes, { ct_host: { call: () => 0 } })
-const response = callCore(instance, { op: 'renderOnce', template: { $blob: 0 }, data: { number: 42 } }, [docxBytes])
+// Node.js, no dependencies. Core is the small host from conformance/core.mjs
+import { Core } from './conformance/core.mjs'
+const core = new Core(new WebAssembly.Module(wasmBytes))
+const response = core.call({ op: 'renderOnce', template: { $blob: 0 }, data: { number: 42 } }, [docxBytes])
 // response.json → { ok: true, result: { document: { $blob: 0 } } }, response.blobs[0] → the .docx
 ```
 

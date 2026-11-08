@@ -81,14 +81,12 @@ impl HostTransport for WasmHost {
         if STATE.get() == POISONED {
             return None;
         }
-        STATE.set(IN_CALLBACK);
         // SAFETY: the request slice lives in module memory for the duration of the call.
         let ptr = unsafe { host_call(request.as_ptr() as usize as u32, request.len() as u32) };
         if STATE.get() == POISONED {
             // ct_call ran from inside the callback and poisoned the instance; stop this call too.
             return None;
         }
-        STATE.set(BUSY);
         if ptr == 0 {
             return None;
         }
@@ -107,12 +105,11 @@ impl HostTransport for WasmHost {
 // stops a call half way and leaves the shadow stack and the heap of that call behind: neither
 // can be restored from inside the module. The state flag notices the trap on the next call and
 // poisons the instance for good; every later call answers `internal` and the host must create a
-// new WebAssembly instance. A `ct_call` made from inside a callback cannot be told apart from a
-// trapped callback, so it poisons the instance as well.
+// new WebAssembly instance. The state stays BUSY during host callbacks: a `ct_call` made from
+// inside a callback cannot be told apart from a trapped callback, so it poisons the instance too.
 const IDLE: u8 = 0;
 const BUSY: u8 = 1;
-const IN_CALLBACK: u8 = 2;
-const POISONED: u8 = 3;
+const POISONED: u8 = 2;
 
 const POISONED_MESSAGE: &str = "The WebAssembly instance is unusable after a trap (a panic, a host exception thrown from a callback, \
 or ct_call made from inside a callback). Create a new instance.";
@@ -134,7 +131,7 @@ fn poisoned() -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn ct_call(req_ptr: u32, req_len: u32) -> u32 {
     if STATE.get() != IDLE {
-        // BUSY: the previous call trapped. IN_CALLBACK: a re-entrant call, or a trapped callback.
+        // BUSY: the previous call trapped, or this is a re-entrant call from a host callback.
         return poisoned();
     }
     STATE.set(BUSY);

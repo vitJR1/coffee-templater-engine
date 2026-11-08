@@ -496,3 +496,382 @@ fn section_depth_error_keeps_other_errors() {
         "{codes:?}"
     );
 }
+
+// ------------------------------------------------------------------------------------------
+// Third review (items 41–59)
+// ------------------------------------------------------------------------------------------
+
+/// Header in row 1, a loop in row 2, then `rows` and `tail`; renders sheet `S` with `n` items.
+fn render_after_loop(rows: &str, tail: &str, n: usize) -> String {
+    render_sheet(&format!(r#"<sheetData><row r="1">{}</row>{}{rows}</sheetData>{tail}"#, cell("A1", "h"), loop_row(2)), n)
+}
+
+fn sheet_rels(list: &[(&str, &str)]) -> String {
+    let rels: String = list
+        .iter()
+        .enumerate()
+        .map(|(i, (t, target))| format!(r#"<Relationship Id="rId{}" Type="{t}" Target="{target}"/>"#, i + 1))
+        .collect();
+    format!(
+        r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#
+    )
+}
+
+// 41: whole columns and rows in sqref
+#[test]
+fn xlsx_sqref_whole_columns_and_rows() {
+    let tail = r#"<conditionalFormatting sqref="A:A"><cfRule type="expression" priority="1"><formula>1</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="5:5"><cfRule type="expression" priority="2"><formula>1</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="list" sqref="C:C D2:D9"><formula1>"a,b"</formula1></dataValidation></dataValidations>"#;
+    let row5 = format!(r#"<row r="5">{}</row>"#, cell("A5", "t"));
+    let xml = render_after_loop(&row5, tail, 3);
+    assert!(xml.contains(r#"sqref="A:A""#) && xml.contains(r#"sqref="7:7""#) && xml.contains(r#"sqref="C:C D2:D11""#), "{xml}");
+    let xml = render_after_loop(&row5, tail, 0);
+    assert!(xml.contains(r#"sqref="A:A""#) && xml.contains(r#"sqref="4:4""#) && xml.contains(r#"sqref="C:C D2:D8""#), "{xml}");
+}
+
+// 42: expanded shared formulas keep sheet names and structured references
+#[test]
+fn xlsx_shared_formula_expansion_tokens() {
+    for (master, e3) in [
+        ("'Q4 Data'!B3*2", "'Q4 Data'!C3*2"),
+        ("SUM(Sales[Q4])+$A3", "SUM(Sales[Q4])+$A3"),
+        ("'FY2024'!B3*2", "'FY2024'!C3*2"),
+        ("B3/SUM(B:B)", "C3/SUM(C:C)"),
+    ] {
+        let row = format!(
+            r#"<row r="3">{}{}<c r="D3"><f t="shared" ref="D3:E3" si="0">{master}</f></c><c r="E3"><f t="shared" si="0"/></c></row>"#,
+            cell("A3", "{{#items}}{{.}}"),
+            cell("B3", "{{/items}}")
+        );
+        let xml = render_sheet(&format!("<sheetData>{row}</sheetData>"), 2);
+        assert!(xml.contains(&format!(r#"<c r="E3"><f>{e3}</f>"#)), "{master}: {xml}");
+    }
+    assert_eq!(
+        coffee_core::formats::xlsx::shift_formula("'Q4 Data'!B3+Sales[Q4]+SUM(B:B)+$A$1", 1, 1),
+        "'Q4 Data'!C4+Sales[Q4]+SUM(C:C)+$A$1"
+    );
+}
+
+// 43: a table emptied by a loop keeps one empty data row instead of taking the next row
+#[test]
+fn xlsx_empty_table_keeps_a_data_row() {
+    let table_rels = sheet_rels(&[("http://schemas.openxmlformats.org/officeDocument/2006/relationships/table", "../tables/table1.xml")]);
+    for (r, totals, below) in [("A1:B2", "", "Total"), ("A1:B3", r#" totalsRowCount="1""#, "Notes")] {
+        let table = format!(
+            r#"<?xml version="1.0"?><table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="T" displayName="T" ref="{r}"{totals}><autoFilter ref="{r}"/></table>"#
+        );
+        let rows = if totals.is_empty() {
+            format!(r#"<row r="3">{}</row>"#, cell("A3", below))
+        } else {
+            format!(r#"<row r="3"><c r="B3"><f>SUBTOTAL(109,T[X])</f></c></row><row r="4">{}</row>"#, cell("A4", below))
+        };
+        let sheet = format!(
+            r#"<sheetData><row r="1">{}</row>{}{rows}</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts>"#,
+            cell("A1", "Name"),
+            loop_row(2)
+        );
+        let tpl = xlsx(&[("S", &sheet)], "", &[("xl/worksheets/_rels/sheet1.xml.rels", &table_rels), ("xl/tables/table1.xml", &table)]);
+        let out = render_xlsx(&tpl, &items(0));
+        let xml = sheet_xml(&out, 1);
+        assert!(xml.contains(r#"<row r="2"/>"#), "{xml}");
+        assert!(read_part(&out, "xl/tables/table1.xml").contains(&format!(r#"ref="{r}""#)));
+    }
+}
+
+// 44: a shared formula whose master row was removed is written out
+#[test]
+fn xlsx_shared_formula_with_removed_master() {
+    let sheet = format!(
+        r#"<sheetData><row r="1">{}</row><row r="2">{}{}<c r="D2"><f t="shared" ref="D2:D4" si="0">C2*2</f></c></row><row r="3"><c r="D3"><f t="shared" si="0"/></c></row><row r="4"><c r="D4"><f t="shared" si="0"/></c></row></sheetData>"#,
+        cell("A1", "h"),
+        cell("A2", "{{#items}}{{.}}"),
+        cell("B2", "{{/items}}")
+    );
+    let xml = render_sheet(&sheet, 0);
+    assert!(!xml.contains("shared"), "{xml}");
+    assert!(xml.contains(r#"<c r="D2"><f>C2*2</f></c>"#) && xml.contains(r#"<c r="D3"><f>C3*2</f></c>"#), "{xml}");
+}
+
+// 45, 50: x14 rules on removed rows go; sparklines are repeated with their row
+#[test]
+fn xlsx_x14_extensions() {
+    let x14 =
+        |inner: &str| format!(r#"<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}" xmlns:x14="x14">{inner}</ext></extLst>"#);
+    let cf = x14(
+        r#"<x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{1}"/><xm:sqref>B2</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings>"#,
+    );
+    let total = format!(r#"<row r="3">{}</row>"#, cell("A3", "Total"));
+    let xml = render_after_loop(&total, &cf, 0);
+    assert!(!xml.contains("x14:") && !xml.contains("extLst"), "{xml}");
+    let spark = x14(
+        r#"<x14:sparklineGroups><x14:sparklineGroup><x14:sparklines><x14:sparkline><xm:f>S!C2:D2</xm:f><xm:sqref>E2</xm:sqref></x14:sparkline></x14:sparklines></x14:sparklineGroup></x14:sparklineGroups>"#,
+    );
+    let xml = render_after_loop(&total, &spark, 3);
+    for k in 2..=4 {
+        assert!(xml.contains(&format!("<x14:sparkline><xm:f>S!C{k}:D{k}</xm:f><xm:sqref>E{k}</xm:sqref></x14:sparkline>")), "{k}: {xml}");
+    }
+    let sort = r#"<autoFilter ref="A1:B1"/><sortState ref="A2:B2"><sortCondition ref="A2:A2"/></sortState>"#;
+    assert!(!render_after_loop(&total, sort, 0).contains("sortState"));
+}
+
+// 46: CF and DV formulas stay relative to the top-left cell of a clamped range
+#[test]
+fn xlsx_range_formulas_after_the_first_row_is_removed() {
+    let tail = r#"<conditionalFormatting sqref="B2:B6"><cfRule type="expression" priority="1"><formula>$B2&lt;0</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="custom" sqref="C2:C6"><formula1>C2&gt;0</formula1></dataValidation></dataValidations>"#;
+    let xml = render_after_loop(&format!(r#"<row r="3">{}</row><row r="6">{}</row>"#, cell("A3", "x"), cell("A6", "y")), tail, 0);
+    assert!(xml.contains(r#"sqref="B2:B5"><cfRule type="expression" priority="1"><formula>$B2&lt;0</formula>"#), "{xml}");
+    assert!(xml.contains(r#"sqref="C2:C5"><formula1>C2&gt;0</formula1>"#), "{xml}");
+}
+
+// 47: a reference right after `:` is renumbered
+#[test]
+fn xlsx_reference_after_a_colon() {
+    let xml = render_after_loop(r#"<row r="5"><c r="A5"><f>SUM(INDEX(B:B,1):B5)+SUM(OFFSET(A1,0,0):$B$5)</f></c></row>"#, "", 3);
+    assert!(xml.contains("<f>SUM(INDEX(B:B,1):B7)+SUM(OFFSET(A1,0,0):$B$7)</f>"), "{xml}");
+}
+
+// 48: references inside a block of two rows stay linear in the number of copies
+#[test]
+fn xlsx_multi_row_blocks_render_in_linear_time() {
+    let sheet = format!(
+        r#"<sheetData><row r="2">{}<c r="C2"><f>B3*2</f></c></row><row r="3">{}<c r="D3"><f>C2*2</f></c></row></sheetData>"#,
+        cell("A2", "{{#items}}{{.}}"),
+        cell("B3", "{{/items}}")
+    );
+    let t = std::time::Instant::now();
+    let xml = render_sheet(&sheet, 20_000);
+    assert!(xml.contains(r#"<c r="C40000"><f>B40001*2</f>"#) && xml.contains(r#"<c r="D40001"><f>C40000*2</f>"#));
+    assert!(t.elapsed().as_secs_f64() < 5.0, "{:?}", t.elapsed());
+}
+
+// 49, 53: chart series anywhere in xl/charts and pivot cache sources follow the rows
+#[test]
+fn xlsx_charts_and_pivot_sources() {
+    let data = format!(r#"<sheetData><row r="1">{}</row>{}</sheetData>"#, cell("A1", "Name"), loop_row(2));
+    let chart = r#"<c:chartSpace xmlns:c="c" xmlns:c15="c15"><c:f>Data!$B$2:$B$2</c:f><c15:f>Data!$A$2:$A$2</c15:f></c:chartSpace>"#;
+    let chart_ex = r#"<cx:chartSpace xmlns:cx="cx"><cx:f>Data!$A$2:$A$2</cx:f></cx:chartSpace>"#;
+    let pivot = r#"<pivotCacheDefinition xmlns="main"><cacheSource type="worksheet"><worksheetSource ref="A1:B2" sheet="Data"/></cacheSource></pivotCacheDefinition>"#;
+    let tpl = xlsx(
+        &[("Data", &data)],
+        "",
+        &[("xl/charts/chart1.xml", chart), ("xl/charts/chartEx1.xml", chart_ex), ("xl/pivotCache/pivotCacheDefinition1.xml", pivot)],
+    );
+    let out = render_xlsx(&tpl, &items(3));
+    let c = read_part(&out, "xl/charts/chart1.xml");
+    assert!(c.contains("<c:f>Data!$B$2:$B$4</c:f>") && c.contains("<c15:f>Data!$A$2:$A$4</c15:f>"), "{c}");
+    assert!(read_part(&out, "xl/charts/chartEx1.xml").contains("<cx:f>Data!$A$2:$A$4</cx:f>"));
+    assert!(read_part(&out, "xl/pivotCache/pivotCacheDefinition1.xml").contains(r#"ref="A1:B4""#));
+}
+
+// 51: pictures that do not resize with cells keep their size
+#[test]
+fn xlsx_one_cell_pictures_keep_their_size() {
+    let drawing = |edit: &str| {
+        format!(
+            r#"<xdr:wsDr xmlns:xdr="xdr"><xdr:twoCellAnchor editAs="{edit}"><xdr:from><xdr:col>4</xdr:col><xdr:row>0</xdr:row></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:row>4</xdr:row></xdr:to></xdr:twoCellAnchor><xdr:twoCellAnchor editAs="{edit}"><xdr:from><xdr:col>0</xdr:col><xdr:row>5</xdr:row></xdr:from><xdr:to><xdr:col>1</xdr:col><xdr:row>6</xdr:row></xdr:to></xdr:twoCellAnchor></xdr:wsDr>"#
+        )
+    };
+    let rels = sheet_rels(&[("http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing", "../drawings/drawing1.xml")]);
+    let sheet = format!(r#"<sheetData><row r="1">{}</row>{}</sheetData><drawing r:id="rId1"/>"#, cell("A1", "h"), loop_row(2));
+    for (edit, first_to) in [("oneCell", 4), ("twoCell", 23)] {
+        let d = drawing(edit);
+        let tpl = xlsx(&[("S", &sheet)], "", &[("xl/worksheets/_rels/sheet1.xml.rels", &rels), ("xl/drawings/drawing1.xml", &d)]);
+        let x = read_part(&render_xlsx(&tpl, &items(20)), "xl/drawings/drawing1.xml");
+        assert!(x.contains(&format!("<xdr:row>{first_to}</xdr:row>")), "{edit}: {x}");
+        assert!(x.contains("<xdr:row>24</xdr:row>") && x.contains("<xdr:row>25</xdr:row>"), "{edit}: {x}");
+    }
+}
+
+// 52, 56: threaded comments and form controls follow their rows
+#[test]
+fn xlsx_threaded_comments_and_form_controls() {
+    let rels = sheet_rels(&[
+        ("http://schemas.microsoft.com/office/2017/10/relationships/threadedComment", "../threadedComments/threadedComment1.xml"),
+        ("http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing", "../drawings/vmlDrawing1.vml"),
+        ("http://schemas.openxmlformats.org/officeDocument/2006/relationships/ctrlProp", "../ctrlProps/ctrlProp1.xml"),
+    ]);
+    let threaded = r#"<ThreadedComments xmlns="tc"><threadedComment ref="B4" id="{1}"><text>check</text></threadedComment><threadedComment ref="B2" id="{2}"><text>gone</text></threadedComment></ThreadedComments>"#;
+    let vml = r#"<xml xmlns:v="v" xmlns:x="x"><v:shape id="s1"><x:ClientData ObjectType="Checkbox"><x:Anchor>2, 0, 3, 0, 3, 0, 4, 0</x:Anchor><x:FmlaLink>$C$4</x:FmlaLink></x:ClientData></v:shape></xml>"#;
+    let ctrl = r#"<formControlPr xmlns="x14" objectType="CheckBox" fmlaLink="$C$4"/>"#;
+    let sheet =
+        format!(r#"<sheetData><row r="1">{}</row>{}<row r="4">{}</row></sheetData>"#, cell("A1", "h"), loop_row(2), cell("A4", "Total"));
+    let tpl = xlsx(
+        &[("S", &sheet)],
+        "",
+        &[
+            ("xl/worksheets/_rels/sheet1.xml.rels", &rels),
+            ("xl/threadedComments/threadedComment1.xml", threaded),
+            ("xl/drawings/vmlDrawing1.vml", vml),
+            ("xl/ctrlProps/ctrlProp1.xml", ctrl),
+        ],
+    );
+    let out = render_xlsx(&tpl, &items(3));
+    let t = read_part(&out, "xl/threadedComments/threadedComment1.xml");
+    assert!(t.contains(r#"ref="B6""#) && t.contains(r#"ref="B2""#), "{t}");
+    let v = read_part(&out, "xl/drawings/vmlDrawing1.vml");
+    assert!(v.contains("<x:Anchor>2, 0, 5, 0, 3, 0, 6, 0</x:Anchor>") && v.contains("<x:FmlaLink>$C$6</x:FmlaLink>"), "{v}");
+    assert!(read_part(&out, "xl/ctrlProps/ctrlProp1.xml").contains(r#"fmlaLink="$C$6""#));
+    let t = read_part(&render_xlsx(&tpl, &items(0)), "xl/threadedComments/threadedComment1.xml");
+    assert!(t.contains(r#"ref="B3""#) && !t.contains("gone"), "{t}");
+}
+
+// 54: AlternateContent pairs keep their shared id; connectors follow the copies of their shapes
+#[test]
+fn drawing_ids_alternate_content_and_connectors() {
+    let alt = r#"<w:p><w:r><mc:AlternateContent xmlns:mc="mc"><mc:Choice Requires="wps"><w:drawing><wp:anchor xmlns:wp="wp"><wp:docPr id="3" name="a"/></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><wp:docPr xmlns:wp="wp" id="3" name="a"/></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"#;
+    let doc = read_part(&render(&docx(alt), "{}"), "word/document.xml");
+    assert_eq!(doc.matches(r#"id="3""#).count(), 2, "{doc}");
+    // in a loop: each copy gets a new id, shared by its Choice and Fallback
+    let tpl = docx(&[p(&["{{#items}}"]), alt.to_string(), p(&["{{/items}}"])].concat());
+    let doc = read_part(&render(&tpl, &items(2)), "word/document.xml");
+    let ids: Vec<&str> = coffee_core::xml::tokenizer::find_local_tags(&doc, "docPr")
+        .map(|(s, e)| coffee_core::xml::tokenizer::raw_attr(&doc[s..e], "id").unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4, "{doc}");
+    assert!(ids[0] == "3" && ids[1] == "3" && ids[2] == ids[3] && ids[2] != "3", "{ids:?}");
+}
+
+// 55: a self-closing data table formula moves with its cell
+#[test]
+fn xlsx_data_table_formula() {
+    let xml = render_after_loop(r#"<row r="5"><c r="B5"><f t="dataTable" ref="B5:C6" dt2D="0" dtr="1" r1="A1"/><v>1</v></c></row>"#, "", 3);
+    assert!(xml.contains(r#"<c r="B7"><f t="dataTable" ref="B7:C8" dt2D="0" dtr="1" r1="A1"/>"#), "{xml}");
+}
+
+// 57: a merge left with one cell is dropped
+#[test]
+fn xlsx_merge_left_with_one_cell() {
+    let sheet = format!(
+        r#"<sheetData><row r="1">{}</row><row r="2">{}</row>{}<row r="4">{}</row></sheetData><mergeCells count="1"><mergeCell ref="C2:C3"/></mergeCells>"#,
+        cell("A1", "h"),
+        cell("C2", "label"),
+        loop_row(3),
+        cell("A4", "t")
+    );
+    assert!(!render_sheet(&sheet, 0).contains("mergeCell"));
+}
+
+// 58: relationships written with single quotes or an end tag are removed with their table
+#[test]
+fn removed_table_relationship_in_other_spellings() {
+    let ty = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
+    for rel in [
+        format!("<Relationship Id='rId1' Type='{ty}' Target='../tables/table1.xml'/>"),
+        format!(r#"<Relationship Id="rId1" Type="{ty}" Target="../tables/table1.xml"></Relationship>"#),
+    ] {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rel}</Relationships>"#
+        );
+        let table = r#"<table xmlns="main" id="1" name="T" displayName="T" ref="A2:B2"/>"#;
+        let sheet = format!(r#"<sheetData>{}</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts>"#, loop_row(2));
+        let out = render_xlsx(
+            &xlsx(&[("S", &sheet)], "", &[("xl/worksheets/_rels/sheet1.xml.rels", &rels), ("xl/tables/table1.xml", table)]),
+            &items(0),
+        );
+        assert!(!read_part(&out, "xl/worksheets/_rels/sheet1.xml.rels").contains("Relationship "), "{rel}");
+    }
+}
+
+// 59: numbers from the document never overflow
+#[test]
+fn xlsx_out_of_range_numbers_from_the_document() {
+    let big = "9223372036854775807";
+    let sheet = format!(
+        r#"<sheetData><row r="{big}"><c r="A1"><v>1</v></c></row><row>{}</row>{}<row r="7"><c r="AAAAAAAAAAAAAAAAAAAA7"><f>1+1</f></c></row></sheetData>"#,
+        cell("A2", "x"),
+        loop_row(3)
+    );
+    render_sheet(&sheet, 3);
+    let rels = sheet_rels(&[
+        ("http://schemas.openxmlformats.org/officeDocument/2006/relationships/table", "../tables/table1.xml"),
+        ("http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing", "../drawings/drawing1.xml"),
+        ("http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing", "../drawings/vmlDrawing1.vml"),
+    ]);
+    let table = format!(r#"<table xmlns="main" id="1" name="T" displayName="T" ref="A1:B2" headerRowCount="{big}"/>"#);
+    let drawing = format!(
+        r#"<xdr:wsDr xmlns:xdr="xdr"><xdr:twoCellAnchor><xdr:from><xdr:row>{big}</xdr:row></xdr:from><xdr:to><xdr:row>-{big}</xdr:row></xdr:to></xdr:twoCellAnchor></xdr:wsDr>"#
+    );
+    let vml = format!(
+        r#"<xml xmlns:v="v" xmlns:x="x"><v:shape id="s"><x:ClientData ObjectType="Note"><x:Row>{big}</x:Row></x:ClientData></v:shape></xml>"#
+    );
+    let sheet = format!(
+        r#"<sheetData><row r="1">{}</row>{}</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts>"#,
+        cell("A1", "h"),
+        loop_row(2)
+    );
+    let tpl = xlsx(
+        &[("S", &sheet)],
+        "",
+        &[
+            ("xl/worksheets/_rels/sheet1.xml.rels", &rels),
+            ("xl/tables/table1.xml", &table),
+            ("xl/drawings/drawing1.xml", &drawing),
+            ("xl/drawings/vmlDrawing1.vml", &vml),
+        ],
+    );
+    for n in [0, 3] {
+        render_xlsx(&tpl, &items(n));
+    }
+}
+
+const PML: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+
+/// Minimal one-slide presentation.
+fn pptx(slide_body: &str, timing: &str) -> Vec<u8> {
+    let ct = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#;
+    let pres =
+        format!(r#"<?xml version="1.0"?><p:presentation {PML}><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>"#);
+    let prels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#;
+    let slide = format!(
+        r#"<?xml version="1.0"?><p:sld {PML}><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{slide_body}</p:spTree></p:cSld>{timing}</p:sld>"#
+    );
+    coffee_core::zip::write(vec![
+        ("[Content_Types].xml", ct.as_bytes()),
+        ("_rels/.rels", rels.as_bytes()),
+        ("ppt/presentation.xml", pres.as_bytes()),
+        ("ppt/_rels/presentation.xml.rels", prels.as_bytes()),
+        ("ppt/slides/slide1.xml", slide.as_bytes()),
+    ])
+    .unwrap()
+}
+
+fn shape(id: u32, text: &str) -> String {
+    format!(
+        r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="Shape {id}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>"#
+    )
+}
+
+fn attr_values(xml: &str, local: &str) -> Vec<String> {
+    coffee_core::xml::tokenizer::find_local_tags(xml, local)
+        .map(|(s, e)| coffee_core::xml::tokenizer::raw_attr(&xml[s..e], "id").unwrap().to_string())
+        .collect()
+}
+
+// 54: PPTX: an AlternateContent pair without loops is left alone, so are animation targets;
+// connectors copied by a loop attach to the shapes of their own copy
+#[test]
+fn pptx_alternate_content_and_connectors() {
+    let alt = format!(
+        r#"<mc:AlternateContent><mc:Choice Requires="a14">{}</mc:Choice><mc:Fallback>{}</mc:Fallback></mc:AlternateContent>"#,
+        shape(4, "x"),
+        shape(4, "x")
+    );
+    let timing = r#"<p:timing><p:bldLst><p:bldP spid="4" grpId="0"/></p:bldLst></p:timing>"#;
+    let x = read_part(&render(&pptx(&format!("{}{alt}", shape(2, "Hello")), timing), "{}"), "ppt/slides/slide1.xml");
+    assert_eq!(attr_values(&x, "cNvPr"), ["1", "2", "4", "4"]);
+
+    let cxn = r#"<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="5" name="Connector 4"/><p:cNvCxnSpPr><a:stCxn id="3" idx="3"/><a:endCxn id="4" idx="1"/></p:cNvCxnSpPr><p:nvPr/></p:nvCxnSpPr><p:spPr/></p:cxnSp>"#;
+    let body = format!("{}{}{}{cxn}{}", shape(2, "{{#items}}"), shape(3, "{{.}}"), shape(4, "B"), shape(6, "{{/items}}"));
+    let x = read_part(&render(&pptx(&body, ""), &items(3)), "ppt/slides/slide1.xml");
+    let ids = attr_values(&x, "cNvPr");
+    assert_eq!(ids.iter().collect::<std::collections::BTreeSet<_>>().len(), ids.len(), "{ids:?}");
+    let (st, end) = (attr_values(&x, "stCxn"), attr_values(&x, "endCxn"));
+    assert_eq!(st.len(), 3);
+    // each connector points to the two shapes right before it in its copy
+    for (k, (s, e)) in st.iter().zip(&end).enumerate() {
+        let at = x.match_indices("<a:stCxn").nth(k).unwrap().0;
+        let before = attr_values(&x[..at], "cNvPr");
+        let n = before.len();
+        assert_eq!((s, e), (&before[n - 3], &before[n - 2]), "copy {k}: {ids:?}");
+    }
+}

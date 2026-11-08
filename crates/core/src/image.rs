@@ -17,13 +17,30 @@ pub struct ResolvedImage {
     pub alt: String,
 }
 
-/// Image formats accepted in `extension` (lower case). Anything else is rejected: the value ends
-/// up in a package path and a content type, and names such as `rels` or `xml` would make the
-/// picture take over the content type of package parts.
-pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "svg", "webp", "emf", "wmf", "ico"];
+/// Image formats accepted in `extension` (lower case) and their content types. Anything else is
+/// rejected: the value ends up in a package path and a content type, and names such as `rels` or
+/// `xml` would make the picture take over the content type of package parts.
+pub const IMAGE_TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("bmp", "image/bmp"),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+    ("svg", "image/svg+xml"),
+    ("webp", "image/webp"),
+    ("emf", "image/x-emf"),
+    ("wmf", "image/x-wmf"),
+    ("ico", "image/x-icon"),
+];
+
+pub fn image_mime(ext: &str) -> Option<&'static str> {
+    IMAGE_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, m)| *m)
+}
 
 pub fn is_safe_extension(ext: &str) -> bool {
-    IMAGE_EXTENSIONS.contains(&ext)
+    image_mime(ext).is_some()
 }
 
 pub fn is_image_value(v: &Value) -> bool {
@@ -65,7 +82,10 @@ pub fn resolve_image(value: &Value) -> Result<ResolvedImage, String> {
         return Err("Cannot detect image format; pass `extension`".into());
     }
     if !is_safe_extension(&extension) {
-        return Err(format!("Invalid image extension {extension:?}: expected one of {}", IMAGE_EXTENSIONS.join(", ")));
+        return Err(format!(
+            "Invalid image extension {extension:?}: expected one of {}",
+            IMAGE_TYPES.iter().map(|(e, _)| *e).collect::<Vec<_>>().join(", ")
+        ));
     }
     let natural = info.filter(|i| i.1 > 0.0 && i.2 > 0.0);
     let (w, h) = (opt_num(o.get("width")), opt_num(o.get("height")));

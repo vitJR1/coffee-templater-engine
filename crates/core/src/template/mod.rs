@@ -14,11 +14,11 @@ use crate::formats::DocumentFormat;
 use crate::host::Host;
 use crate::opc::Package;
 use crate::value::Value;
-use crate::xml::tokenizer::{find_local_tags, raw_attr, set_raw_attribute};
+use crate::xml::tokenizer::{element_end, find_local_tags, find_tags, raw_attr, set_raw_attribute};
 use engine::{compile_part, inspect_nodes, render_part, CompiledPart, RenderCtx, TemplateTag};
 use options::Options;
 use serde_json::{json, Map, Value as SJson};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// A parsed template, ready to be rendered many times.
 #[derive(Debug, Clone)]
@@ -31,6 +31,8 @@ pub struct Template {
     /// First id for new drawings: above every `docPr`/`cNvPr` id in the template (repeats are fixed
     /// after rendering).
     first_drawing_id: u32,
+    /// Per template part: how often each drawing id occurs (DOCX/PPTX).
+    drawing_ids: Vec<HashMap<u32, usize>>,
 }
 
 /// New drawing ids start here (as in the TS version) unless the template already uses higher ids.
@@ -45,49 +47,96 @@ fn max_drawing_id(xml: &str) -> u32 {
     drawing_ids(xml, "docPr").chain(drawing_ids(xml, "cNvPr")).filter_map(|(_, _, id)| id).max().unwrap_or(0)
 }
 
-/// Gives a fresh id to every repeated `local` element id (drawings copied by loops) across the
-/// parts of one scope: the whole document for DOCX `docPr`, one slide for PPTX `cNvPr`.
-fn dedupe_drawing_ids(pkg: &mut Package, parts: &[&str], local: &str) {
-    let texts: Vec<(String, String)> = parts.iter().filter_map(|p| pkg.get_text(p).map(|x| (p.to_string(), x))).collect();
-    let mut used = HashSet::new();
-    let mut seen = HashSet::new();
-    let mut duplicates = false;
-    for (_, xml) in &texts {
-        for (_, _, id) in drawing_ids(xml, local) {
-            if let Some(id) = id {
-                duplicates |= !seen.insert(id);
-                used.insert(id);
-            }
+/// Every `local` id of `xml`: (start, end, id, start of the enclosing `mc:AlternateContent`,
+/// inside `mc:Fallback`). Office writes the same id in `mc:Choice` and `mc:Fallback` on purpose.
+fn id_occurrences(xml: &str, local: &str) -> Vec<(usize, usize, u32, Option<usize>, bool)> {
+    let ranges = |tag: &str| -> Vec<(usize, usize)> {
+        if !xml.contains(tag) {
+            return Vec::new();
         }
-    }
-    if !duplicates {
-        return;
-    }
-    let mut next = used.iter().max().copied().unwrap_or(0);
-    let mut fresh = || loop {
-        next = next.checked_add(1).unwrap_or(1);
-        if used.insert(next) {
-            return next;
-        }
+        find_tags(xml, tag).filter_map(|(s, e)| Some((s, element_end(xml, s, e)?))).collect()
     };
-    let mut seen = HashSet::new();
-    for (part, xml) in texts {
-        let mut out = String::with_capacity(xml.len());
-        let mut last = 0;
-        for (s, e, id) in drawing_ids(&xml, local) {
-            let Some(id) = id else { continue };
-            if seen.insert(id) {
-                continue;
+    let (alts, fallbacks) = (ranges("<mc:AlternateContent"), ranges("<mc:Fallback"));
+    drawing_ids(xml, local)
+        .filter_map(|(s, e, id)| {
+            let alt = alts.iter().rev().find(|(a, b)| *a <= s && s < *b).map(|(a, _)| *a);
+            let fallback = fallbacks.iter().any(|(a, b)| *a <= s && s < *b);
+            Some((s, e, id?, alt, fallback))
+        })
+        .collect()
+}
+
+/// How often the template uses each drawing id (fallback copies not counted).
+fn template_ids(xml: &str, local: &str) -> HashMap<u32, usize> {
+    let mut m = HashMap::new();
+    for (_, _, id, _, fallback) in id_occurrences(xml, local) {
+        if !fallback {
+            *m.entry(id).or_default() += 1;
+        }
+    }
+    m
+}
+
+/// Gives a fresh id (from `counter`) to drawing ids that occur more often than in the template:
+/// drawings copied by loops. `seen` counts occurrences across the scope (DOCX: the document,
+/// PPTX: one slide). The `mc:Fallback` of a renumbered `mc:Choice` gets the same new id, and
+/// connectors (`a:stCxn`, `a:endCxn`) follow the latest id given to the shape they refer to.
+fn dedupe_drawing_ids(
+    xml: String,
+    local: &str,
+    template: &HashMap<u32, usize>,
+    seen: &mut HashMap<u32, usize>,
+    counter: &mut u32,
+) -> String {
+    if !xml.contains(local) {
+        return xml;
+    }
+    // (start, end, id, enclosing AlternateContent, in a Fallback, is a connection)
+    let mut items: Vec<(usize, usize, u32, Option<usize>, bool, bool)> =
+        id_occurrences(&xml, local).into_iter().map(|(s, e, id, alt, fb)| (s, e, id, alt, fb, false)).collect();
+    if local == "cNvPr" && xml.contains("Cxn ") {
+        for tag in ["<a:stCxn", "<a:endCxn"] {
+            for (s, e) in find_tags(&xml, tag) {
+                if let Some(id) = raw_attr(&xml[s..e], "id").and_then(|v| v.trim().parse::<u32>().ok()) {
+                    items.push((s, e, id, None, false, true));
+                }
             }
+        }
+        items.sort_by_key(|i| i.0);
+    }
+    let mut out = String::with_capacity(xml.len());
+    let mut last = 0;
+    let mut renamed: HashMap<(usize, u32), u32> = HashMap::new();
+    let mut latest: HashMap<u32, u32> = HashMap::new();
+    for (s, e, id, alt, fallback, connection) in items {
+        let new = if connection {
+            latest.get(&id).copied().filter(|n| *n != id)
+        } else if fallback {
+            alt.and_then(|a| renamed.get(&(a, id)).copied())
+        } else {
+            let n = seen.entry(id).or_default();
+            *n += 1;
+            let fresh = (*n > template.get(&id).copied().unwrap_or(0).max(1)).then(|| {
+                *counter = counter.checked_add(1).unwrap_or(1);
+                if let Some(a) = alt {
+                    renamed.insert((a, id), *counter);
+                }
+                *counter
+            });
+            latest.insert(id, fresh.unwrap_or(id));
+            fresh
+        };
+        if let Some(new) = new {
             out.push_str(&xml[last..s]);
-            out.push_str(&set_raw_attribute(&xml[s..e], "id", &fresh().to_string()));
+            out.push_str(&set_raw_attribute(&xml[s..e], "id", &new.to_string()));
             last = e;
         }
-        if last > 0 {
-            out.push_str(&xml[last..]);
-            pkg.set_text(&part, &out);
-        }
     }
+    if last == 0 {
+        return xml;
+    }
+    out.push_str(&xml[last..]);
+    out
 }
 
 impl Template {
@@ -101,12 +150,14 @@ impl Template {
         let mut compiled = Vec::new();
         let mut errors = Vec::new();
         let mut first_drawing_id = DRAWING_ID_BASE;
+        let mut drawing_ids = Vec::new();
         for part in format.template_parts(&pkg) {
             let mut xml = pkg.get_text(&part).unwrap_or_default();
             if format == DocumentFormat::Xlsx {
                 xml = xlsx::preprocess(&pkg, &part, &xml, &mut xlsx, &opts.start);
             } else {
                 first_drawing_id = first_drawing_id.max(max_drawing_id(&xml));
+                drawing_ids.push(template_ids(&xml, format.drawing_id_element()));
             }
             match compile_part(&xml, hooks, &opts, &part) {
                 Ok(c) => compiled.push(c),
@@ -117,7 +168,7 @@ impl Template {
             return Err(Errors(errors));
         }
         xlsx.shared = None; // only needed while compiling
-        Ok(Template { format, pkg, compiled, opts, xlsx, first_drawing_id })
+        Ok(Template { format, pkg, compiled, opts, xlsx, first_drawing_id, drawing_ids })
     }
 
     pub fn options(&self) -> &Options {
@@ -144,29 +195,36 @@ impl Template {
             host_calls: 0,
         };
         let mut row_maps = Vec::new();
-        for c in &self.compiled {
+        // drawing ids are unique across a DOCX document, and within one PPTX slide
+        let doc_ids: HashMap<u32, usize> = match self.format {
+            DocumentFormat::Docx => self.drawing_ids.iter().flat_map(|m| m.iter()).fold(HashMap::new(), |mut acc, (id, n)| {
+                *acc.entry(*id).or_default() += n;
+                acc
+            }),
+            _ => HashMap::new(),
+        };
+        let mut doc_seen = HashMap::new();
+        for (i, c) in self.compiled.iter().enumerate() {
             ctx.part = c.part.clone();
             let mut xml = render_part(c, data, hooks, &mut ctx)?;
-            if self.format == DocumentFormat::Xlsx {
-                let (next, map) = xlsx::postprocess(&xml, &c.part, &self.xlsx);
-                xml = next;
-                if let Some(m) = map {
-                    row_maps.push((c.part.clone(), m));
+            match self.format {
+                DocumentFormat::Xlsx => {
+                    let (next, map) = xlsx::postprocess(&xml, &c.part, &self.xlsx);
+                    xml = next;
+                    if let Some(m) = map {
+                        row_maps.push((c.part.clone(), m));
+                    }
+                }
+                DocumentFormat::Docx => xml = dedupe_drawing_ids(xml, "docPr", &doc_ids, &mut doc_seen, &mut ctx.doc_pr),
+                DocumentFormat::Pptx => {
+                    let mut seen = HashMap::new();
+                    xml = dedupe_drawing_ids(xml, "cNvPr", &self.drawing_ids[i], &mut seen, &mut ctx.shape_id);
                 }
             }
             ctx.pkg.set_text(&c.part, &xml);
         }
-        match self.format {
-            DocumentFormat::Xlsx => xlsx::finalize(ctx.pkg, &row_maps),
-            DocumentFormat::Docx => {
-                let parts: Vec<&str> = self.compiled.iter().map(|c| c.part.as_str()).collect();
-                dedupe_drawing_ids(ctx.pkg, &parts, "docPr");
-            }
-            DocumentFormat::Pptx => {
-                for c in &self.compiled {
-                    dedupe_drawing_ids(ctx.pkg, &[c.part.as_str()], "cNvPr");
-                }
-            }
+        if self.format == DocumentFormat::Xlsx {
+            xlsx::finalize(ctx.pkg, &row_maps);
         }
         pkg.to_bytes(&self.opts.limits)
     }

@@ -19,6 +19,14 @@ pub enum DocumentFormat {
 }
 
 impl DocumentFormat {
+    /// Local name of the elements whose `id` must be unique (drawings, shapes).
+    pub fn drawing_id_element(self) -> &'static str {
+        match self {
+            DocumentFormat::Pptx => "cNvPr",
+            _ => "docPr",
+        }
+    }
+
     pub const ALL: [DocumentFormat; 3] = [DocumentFormat::Docx, DocumentFormat::Xlsx, DocumentFormat::Pptx];
 
     pub fn as_str(self) -> &'static str {

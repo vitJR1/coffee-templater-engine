@@ -201,7 +201,9 @@ formatting, declare a host filter named `currency`.
 - `null`, `false` or `""` removes the tag. In strict mode a missing value is an error.
 - The same image (same bytes and extension) used many times, for example in a loop, is stored once
   in the package. New drawing ids continue after the highest id already present in the template,
-  and drawings repeated by a loop get fresh ids, so ids stay unique.
+  and drawings repeated by a loop get fresh ids, so ids stay unique. The `mc:Choice` and
+  `mc:Fallback` of one drawing keep sharing their id, and connectors in a copied PowerPoint
+  slide area follow the copies of their shapes.
 
 In **Word** the picture is inline, at the tag position. In **PowerPoint** the tag must be the
 content of a text box or placeholder: the shape is replaced by the picture, which is fitted
@@ -219,21 +221,27 @@ content of a text box or placeholder: the shape is replaced by the picture, whic
   titles, named ranges), tables (range, auto filter, sort state), the sheet's auto filter and sort
   state, merged ranges, conditional formatting and data validation (ranges and formulas, including
   the x14 extensions), hyperlinks (cells and `location`), page breaks, ignored errors, protected
-  ranges, cell comments and their VML notes, drawing anchors and chart series.
+  ranges, cell comments (classic and threaded) and their VML notes, form controls (position and
+  linked cells), drawing anchors, chart series (embedded charts, chart sheets, chartEx, data label
+  ranges) and pivot cache sources. Pictures anchored `oneCell` or `absolute` keep their size;
+  `twoCell` pictures grow with the rows inserted inside them.
+- Relative references in formulas of conditional formatting and data validation stay relative to
+  the top-left cell of their range, also when the range's first rows are removed.
 - Inside a repeated row, a reference to the same row (or to another row of the same repeated block)
-  points to the same copy; merges and one-cell ranges of conditional formatting and validation
-  (`sqref="B3"`) are duplicated over all copies. References from outside a loop to a looped row
-  cover every copy when they are ranges, and the first copy otherwise.
-- Shared formulas (`<f t="shared">`) that touch a repeated row are written out as ordinary formulas.
+  points to the same copy; merges, sparklines and one-cell ranges of conditional formatting and
+  validation (`sqref="B3"`) are duplicated over all copies. References from outside a loop to a
+  looped row cover every copy when they are ranges, and the first copy otherwise.
+- Shared formulas (`<f t="shared">`) that touch a repeated row, or whose first cell was removed,
+  are written out as ordinary formulas.
 - References to other workbooks (`[1]Data!A5`), 3D references (`S1:S3!A5`), structured references
   (`Table1[Col]`) and names are left as they are. Ranges that end on the last row of the sheet
   (`A2:A1048576`) keep ending there.
 - Rows removed by an empty loop behave as if deleted in Excel: a reference to them becomes `#REF!`,
   and a range is clamped to its remaining rows (`#REF!` when none remain). Merges, validations,
   formatting, hyperlinks, comments, page breaks and auto filters that covered only removed rows are
-  dropped, and so is a table whose rows are all gone. A table left without data rows keeps one
-  (Excel does not open tables without data rows). Wrap totals over a loop that may be empty in
-  `IFERROR(…, 0)`.
+  dropped, and so is a table whose rows are all gone. A table whose data rows were all removed
+  keeps its first data row, empty (Excel does not open tables without data rows). A merge left
+  with a single cell is dropped. Wrap totals over a loop that may be empty in `IFERROR(…, 0)`.
 - A formula in a cell that receives a number or boolean is kept, with the value as its cached result.
 - `calcChain.xml` is removed and `fullCalcOnLoad="1"` is set, so Excel recalculates on open.
 - Shared strings containing tags are inlined into their cells.
@@ -496,8 +504,9 @@ Module: `wasm32-unknown-unknown`, no WASI. Exports linear memory `memory`.
 3. Write `[u32 frame_len][frame]` at `out` and return `out`.
 
 The import must always be provided. If no callbacks are used, a stub returning 0 is enough.
-A complete host in about 100 lines of plain JavaScript is
-[`conformance/run-wasm.mjs`](conformance/run-wasm.mjs).
+A complete host in about 80 lines of plain JavaScript (frames, memory management and the
+`ct_host.call` import) is [`conformance/core.mjs`](conformance/core.mjs);
+[`conformance/run-wasm.mjs`](conformance/run-wasm.mjs) runs the conformance cases with it.
 
 ### C ABI
 

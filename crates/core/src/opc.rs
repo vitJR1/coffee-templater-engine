@@ -46,40 +46,7 @@ pub struct Package {
     media_by_ptr: HashMap<(usize, String, String), String>,
 }
 
-fn image_mime(ext: &str) -> String {
-    match ext {
-        "png" => "image/png".into(),
-        "jpeg" | "jpg" => "image/jpeg".into(),
-        "gif" => "image/gif".into(),
-        "bmp" => "image/bmp".into(),
-        "tiff" | "tif" => "image/tiff".into(),
-        "ico" => "image/x-icon".into(),
-        "svg" => "image/svg+xml".into(),
-        "webp" => "image/webp".into(),
-        "emf" => "image/x-emf".into(),
-        "wmf" => "image/x-wmf".into(),
-        other => format!("image/{other}"),
-    }
-}
-
 use crate::xml::tokenizer::find_tags;
-
-/// Value of `name="..."` inside a raw tag, where `name` is preceded by a non-word character.
-fn attr_in(raw: &str, name: &str) -> Option<String> {
-    let pat = format!("{name}=\"");
-    let mut from = 0;
-    while let Some(p) = raw[from..].find(&pat).map(|p| p + from) {
-        from = p + 1;
-        let prev = if p == 0 { None } else { raw.as_bytes().get(p - 1).copied() };
-        if matches!(prev, Some(c) if c.is_ascii_alphanumeric() || c == b'_') {
-            continue;
-        }
-        let vs = p + pat.len();
-        let ve = raw[vs..].find('"')? + vs;
-        return Some(raw[vs..ve].to_string());
-    }
-    None
-}
 
 impl Package {
     pub fn new(files: IndexMap<String, Rc<[u8]>>) -> Self {
@@ -246,32 +213,38 @@ impl Package {
         id
     }
 
-    /// Removes relationships matching `pred` (`<Relationship .../>` elements). Returns the removed ones.
+    /// Removes relationships matching `pred`. Returns the removed ones.
     pub fn remove_relationships(&mut self, part: &str, pred: impl Fn(&Relationship) -> bool) -> Vec<Relationship> {
         let rels_path = Package::rels_path_for(part);
         let Some(xml) = self.get_text(&rels_path) else { return Vec::new() };
         let mut removed = Vec::new();
         let mut out = String::with_capacity(xml.len());
         let mut last = 0;
-        for (s, e) in find_tags(&xml, "<Relationship").collect::<Vec<_>>() {
-            let raw = &xml[s..e];
-            if !raw.ends_with("/>") {
+        let mut skip_to = 0;
+        for (s, e) in find_tags(&xml, "<Relationship") {
+            if s < skip_to {
                 continue;
             }
+            let Some(end) = crate::xml::tokenizer::element_end(&xml, s, e) else { break };
+            skip_to = end;
+            let raw = &xml[s..e];
+            let attr = |n: &str| crate::xml::tokenizer::raw_attr(raw, n).map(|v| crate::xml::escape::decode_xml(v).into_owned());
             let r = Relationship {
-                id: attr_in(raw, "Id").unwrap_or_default(),
-                rel_type: attr_in(raw, "Type").unwrap_or_default(),
-                target: attr_in(raw, "Target").unwrap_or_default(),
-                target_mode: None,
+                id: attr("Id").unwrap_or_default(),
+                rel_type: attr("Type").unwrap_or_default(),
+                target: attr("Target").unwrap_or_default(),
+                target_mode: attr("TargetMode"),
             };
             if pred(&r) {
                 out.push_str(&xml[last..s]);
-                last = e;
+                last = end;
                 removed.push(r);
             }
         }
-        out.push_str(&xml[last..]);
-        self.set_text(&rels_path, &out);
+        if !removed.is_empty() {
+            out.push_str(&xml[last..]);
+            self.set_text(&rels_path, &out);
+        }
         removed
     }
 
@@ -318,11 +291,12 @@ impl Package {
             return Err(Error::new(crate::ErrorCode::InvalidImage, format!("Invalid image extension {ext:?}")));
         }
         // the same value used again (an image in a loop): no hashing, no byte comparison
-        let same = self.media_by_ptr.get(&(Rc::as_ptr(&data) as *const u8 as usize, media_dir.to_string(), ext.clone()));
-        let existing = same.filter(|m| self.files.get(*m).is_some_and(|b| Rc::ptr_eq(b, &data))).cloned();
-        let key = (crc32fast::hash(&data), data.len(), media_dir.to_string(), ext.clone());
-        let existing =
-            existing.or_else(|| self.media_index.get(&key).filter(|m| self.files.get(*m).is_some_and(|b| b[..] == data[..])).cloned());
+        let ptr_key = (Rc::as_ptr(&data) as *const u8 as usize, media_dir.to_string(), ext.clone());
+        let same = self.media_by_ptr.get(&ptr_key).filter(|m| self.files.get(*m).is_some_and(|b| Rc::ptr_eq(b, &data))).cloned();
+        let existing = same.or_else(|| {
+            let key = (crc32fast::hash(&data), data.len(), media_dir.to_string(), ext.clone());
+            self.media_index.get(&key).filter(|m| self.files.get(*m).is_some_and(|b| b[..] == data[..])).cloned()
+        });
         let media = match existing {
             Some(m) => m,
             None => {
@@ -331,10 +305,11 @@ impl Package {
                     n += 1;
                 }
                 let media = format!("{media_dir}/image_ct{n}.{ext}");
-                self.media_by_ptr.insert((Rc::as_ptr(&data) as *const u8 as usize, media_dir.to_string(), ext.clone()), media.clone());
+                let key = (crc32fast::hash(&data), data.len(), media_dir.to_string(), ext.clone());
+                self.media_by_ptr.insert(ptr_key, media.clone());
                 self.files.insert(media.clone(), data);
                 self.media_index.insert(key, media.clone());
-                self.ensure_default_content_type(&ext, &image_mime(&ext));
+                self.ensure_default_content_type(&ext, crate::image::image_mime(&ext).unwrap_or("application/octet-stream"));
                 // a new file cannot be referenced yet
                 let target = relative_path(part.rfind('/').map(|i| &part[..i]).unwrap_or(""), &media);
                 return Ok(self.add_relationship(part, rel::IMAGE, &target, false));
