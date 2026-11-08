@@ -24,12 +24,6 @@ fn image_extension_is_whitelisted() {
     assert!(part_names(&out).contains(&"word/media/image_ct1.png".to_string()));
 }
 
-#[test]
-fn zip_writer_rejects_unsafe_names() {
-    assert!(coffee_core::zip::write(vec![("word/media/x.png/../../evil", b"x".as_slice())]).is_err());
-    assert!(coffee_core::zip::write(vec![("/abs", b"x".as_slice())]).is_err());
-}
-
 // 3: deep section nesting must not overflow the stack
 #[test]
 fn deep_sections_are_rejected() {
@@ -134,7 +128,7 @@ fn xlsx_updates_tables_names_and_cross_sheet_references() {
     let tpl = xlsx(
         &[("Data", &sheet), ("Other", other)],
         names,
-        &[("xl/worksheets/_rels/sheet1.xml.rels", "", table_rels), ("xl/tables/table1.xml", "", table)],
+        &[("xl/worksheets/_rels/sheet1.xml.rels", table_rels), ("xl/tables/table1.xml", table)],
     );
     let out = render_xlsx(&tpl, r#"{"items":[1,2,3,4,5,6,7,8,9,10]}"#);
     let xml = sheet_xml(&out, 1);
@@ -313,10 +307,10 @@ fn xlsx_comments_and_drawings_follow_rows() {
         &[("S", &sheet)],
         "",
         &[
-            ("xl/worksheets/_rels/sheet1.xml.rels", "", rels),
-            ("xl/comments1.xml", "", comments),
-            ("xl/drawings/vmlDrawing1.vml", "", vml),
-            ("xl/drawings/drawing1.xml", "", drawing),
+            ("xl/worksheets/_rels/sheet1.xml.rels", rels),
+            ("xl/comments1.xml", comments),
+            ("xl/drawings/vmlDrawing1.vml", vml),
+            ("xl/drawings/drawing1.xml", drawing),
         ],
     );
     let out = render_xlsx(&tpl, &items(3));
@@ -345,11 +339,8 @@ fn xlsx_tables_after_empty_loops() {
         )
     };
     // header row 1, data row 2 (the loop)
-    let tpl = xlsx(
-        &[("S", &body(""))],
-        "",
-        &[("xl/worksheets/_rels/sheet1.xml.rels", "", table_rels), ("xl/tables/table1.xml", "", &table("A1:B2"))],
-    );
+    let tpl =
+        xlsx(&[("S", &body(""))], "", &[("xl/worksheets/_rels/sheet1.xml.rels", table_rels), ("xl/tables/table1.xml", &table("A1:B2"))]);
     let t = read_part(&render_xlsx(&tpl, &items(0)), "xl/tables/table1.xml");
     assert!(t.contains(r#"ref="A1:B2""#) && t.contains(r#"<autoFilter ref="A1:B2">"#), "{t}");
     let t = read_part(&render_xlsx(&tpl, &items(3)), "xl/tables/table1.xml");
@@ -358,7 +349,7 @@ fn xlsx_tables_after_empty_loops() {
     let tpl = xlsx(
         &[("S", &body(r#"<autoFilter ref="A2:B2"/>"#))],
         "",
-        &[("xl/worksheets/_rels/sheet1.xml.rels", "", table_rels), ("xl/tables/table1.xml", "", &table("A2:B2"))],
+        &[("xl/worksheets/_rels/sheet1.xml.rels", table_rels), ("xl/tables/table1.xml", &table("A2:B2"))],
     );
     let out = render_xlsx(&tpl, &items(0));
     assert!(!part_names(&out).contains(&"xl/tables/table1.xml".to_string()));

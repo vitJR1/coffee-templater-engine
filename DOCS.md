@@ -565,9 +565,11 @@ Always on, not configurable:
 - Sizes are checked against the declared sizes before inflating, and inflation is capped.
 - XML nesting is capped at 1 024 levels even when `maxXmlDepth` is 0 or larger.
 - Template sections nest at most 48 levels deep (`limit_exceeded`, `details.limit = "sectionDepth"`).
-- JSON nesting in requests is limited to 128 levels. A model of a very deeply nested document
-  (about 20 tables nested in each other) can therefore come out of `parse` but not go back into
-  `build`.
+- JSON nesting in requests is limited to 128 levels, except the `model` of `build`, which may nest
+  `2 × maxXmlDepth + 64` levels (at most 2112): a model returned by `parse` always goes back into
+  `build` with the same limits. Responses of `parse` can be deeper than 128 levels too; JSON
+  libraries with a small default limit (e.g. Rust `serde_json`) must be told to accept them.
+  Natively, models near the hard XML depth limit need about 1 MiB of thread stack.
 - Package entry names are validated when writing, too.
 
 ---

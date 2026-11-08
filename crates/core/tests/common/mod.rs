@@ -89,7 +89,7 @@ pub const PNG_2X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQ
 
 /// Minimal workbook: `sheets` = (name, sheetData + following XML), plus extra files
 /// (e.g. tables) and extra workbook XML (e.g. definedNames).
-pub fn xlsx(sheets: &[(&str, &str)], workbook_extra: &str, extra: &[(&str, &str, &str)]) -> Vec<u8> {
+pub fn xlsx(sheets: &[(&str, &str)], workbook_extra: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     let mut ct = String::from(
         r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>"#,
     );
@@ -117,7 +117,7 @@ pub fn xlsx(sheets: &[(&str, &str)], workbook_extra: &str, extra: &[(&str, &str,
         ("xl/_rels/workbook.xml.rels".into(), wb_rels),
     ];
     all.extend(files);
-    for (path, _, content) in extra {
+    for (path, content) in extra {
         all.push((path.to_string(), content.to_string()));
     }
     zip::write(all.iter().map(|(k, v)| (k.as_str(), v.as_bytes()))).unwrap()

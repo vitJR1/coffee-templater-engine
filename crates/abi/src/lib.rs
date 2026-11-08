@@ -90,11 +90,16 @@ impl Instance {
             Ok(f) => f,
             Err(e) => return error_frame(None, &Errors::from(invalid(e.0))),
         };
-        let req = match json::parse(&frame.json) {
+        // A `build` model may nest as deep as the XML it describes; everything else is limited to
+        // json::MAX_DEPTH. The parser takes the larger limit, the fields are checked right after.
+        let req = match json::parse_with_depth(&frame.json, json::MAX_MODEL_DEPTH) {
             Ok(j @ Json::Obj(_)) => j,
             Ok(_) => return error_frame(None, &Errors::from(invalid("Request must be a JSON object"))),
             Err(e) => return error_frame(None, &Errors::from(e)),
         };
+        if let Err(e) = check_depth(&req) {
+            return error_frame(None, &Errors::from(e));
+        }
         let id = req.get("id").map(Json::to_serde);
         let blobs: Vec<Rc<[u8]>> = frame.blobs.into_iter().map(Rc::from).collect();
         let result = match req.get("op").and_then(Json::as_str) {
@@ -226,6 +231,28 @@ fn blob(req: &Json, field: &str, blobs: &[Rc<[u8]>]) -> Result<Option<Rc<[u8]>>,
             _ => Err(invalid(format!("\"{field}\" must be {{\"$blob\": <index>}}"))),
         },
     }
+}
+
+/// Nesting limits of a request: `model` of `build` may be as deep as a model of a document within
+/// the request's `maxXmlDepth`; every other field is limited to `json::MAX_DEPTH`.
+fn check_depth(req: &Json) -> Result<(), Error> {
+    let Json::Obj(fields) = req else { return Ok(()) };
+    let is_build = req.get("op").and_then(Json::as_str) == Some("build");
+    let xml_depth = req
+        .get("limits")
+        .and_then(|l| l.get("maxXmlDepth"))
+        .and_then(|d| match d {
+            Json::Num(n) => n.parse::<u64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(Limits::default().max_xml_depth);
+    for (k, v) in fields {
+        let max = if is_build && k == "model" { json::model_depth(xml_depth) } else { json::MAX_DEPTH };
+        if v.depth(max + 1) > max {
+            return Err(invalid(format!("Invalid JSON: \"{k}\" is nested too deep")));
+        }
+    }
+    Ok(())
 }
 
 fn limits(req: &Json) -> Result<Limits, Error> {

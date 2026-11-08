@@ -242,3 +242,38 @@ fn panics_become_internal_errors() {
     let (r, _) = call(&mut inst, json!({"op": "info"}), vec![]);
     assert_eq!(r["ok"], true);
 }
+
+/// Docx model with `n` tables nested in each other (6 JSON levels per table).
+fn nested_tables_model(n: usize) -> String {
+    let mut b = r#"{"type":"paragraph","children":[{"type":"run","text":"x"}]}"#.to_string();
+    for _ in 0..n {
+        b = format!(r#"{{"type":"table","rows":[{{"cells":[{{"blocks":[{b}]}}]}}]}}"#);
+    }
+    format!(r#"{{"format":"docx","modelVersion":1,"parts":[{{"path":"word/document.xml","kind":"body","blocks":[{b}]}}]}}"#)
+}
+
+/// Response JSON parsed with the model depth limit (serde_json stops at 128 levels).
+fn deep_call(inst: &mut Instance, json: &str, blobs: Vec<Vec<u8>>) -> (coffee_core::json::Json, Vec<Vec<u8>>) {
+    let resp = Frame::decode(&inst.call(&request(json, blobs))).unwrap();
+    (coffee_core::json::parse_with_depth(&resp.json, coffee_core::json::MAX_MODEL_DEPTH).unwrap(), resp.blobs)
+}
+
+// Review 35: a model from `parse` always fits into a `build` request, even for documents close to
+// the XML depth limit.
+#[test]
+fn deep_models_round_trip() {
+    let run = || {
+        let mut inst = Instance::default();
+        let limits = r#""limits":{"maxXmlDepth":0}"#;
+        let (r, blobs) = deep_call(&mut inst, &format!(r#"{{"op":"build","model":{},{limits}}}"#, nested_tables_model(160)), vec![]);
+        assert_eq!(r.get("ok"), Some(&coffee_core::json::Json::Bool(true)), "{r:?}");
+        let (r, _) = deep_call(&mut inst, &format!(r#"{{"op":"parse","document":{{"$blob":0}},{limits}}}"#), blobs);
+        let model = r.get("result").and_then(|r| r.get("model")).expect("parse result");
+        let mut text = String::new();
+        coffee_core::json::write(&mut text, model);
+        let (r, _) = deep_call(&mut inst, &format!(r#"{{"op":"build","model":{text},{limits}}}"#), vec![]);
+        assert_eq!(r.get("ok"), Some(&coffee_core::json::Json::Bool(true)), "{r:?}");
+    };
+    // debug builds use far more stack per level than release builds
+    std::thread::Builder::new().stack_size(64 << 20).spawn(run).unwrap().join().unwrap();
+}

@@ -3,6 +3,7 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use serde_json::{Map, Number, Value as SJson};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
@@ -16,13 +17,27 @@ pub enum Json {
     Obj(Vec<(String, Json)>),
 }
 
-/// Nesting limit: keeps recursion well inside the 1 MiB wasm stack.
-const MAX_DEPTH: usize = 128;
+/// Default nesting limit: keeps recursion well inside the 1 MiB wasm stack.
+pub const MAX_DEPTH: usize = 128;
+
+/// Nesting a document model can need: two JSON levels per XML level, plus room for the request.
+/// A model from `parse` therefore always fits into a `build` request with the same limits.
+pub fn model_depth(max_xml_depth: u64) -> usize {
+    2 * crate::limits::xml_depth(max_xml_depth) as usize + 64
+}
+
+/// The deepest JSON [`parse_with_depth`] may be asked to accept.
+pub const MAX_MODEL_DEPTH: usize = 2 * crate::limits::HARD_MAX_XML_DEPTH as usize + 64;
 
 pub fn parse(text: &str) -> Result<Json> {
-    let mut p = Parser { s: text.as_bytes(), i: 0, src: text };
+    parse_with_depth(text, MAX_DEPTH)
+}
+
+/// Parses JSON nested at most `max_depth` levels (capped at [`MAX_MODEL_DEPTH`]).
+pub fn parse_with_depth(text: &str, max_depth: usize) -> Result<Json> {
+    let mut p = Parser { s: text.as_bytes(), i: 0, src: text, max_depth: max_depth.min(MAX_MODEL_DEPTH) };
     p.ws();
-    let v = p.value(0)?;
+    let v = p.value()?;
     p.ws();
     if p.i != p.s.len() {
         return Err(p.err("unexpected trailing characters"));
@@ -34,6 +49,7 @@ struct Parser<'a> {
     s: &'a [u8],
     i: usize,
     src: &'a str,
+    max_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -56,79 +72,113 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn value(&mut self, depth: usize) -> Result<Json> {
-        if depth > MAX_DEPTH {
-            return Err(self.err("nesting too deep"));
+    /// `"key"` followed by `:`.
+    fn key(&mut self) -> Result<String> {
+        self.ws();
+        if self.s.get(self.i) != Some(&b'"') {
+            return Err(self.err("expected a key"));
         }
-        match self.s.get(self.i) {
-            None => Err(self.err("unexpected end")),
-            Some(b'n') if self.eat("null") => Ok(Json::Null),
-            Some(b't') if self.eat("true") => Ok(Json::Bool(true)),
-            Some(b'f') if self.eat("false") => Ok(Json::Bool(false)),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b'[') => {
-                self.i += 1;
-                let mut out = Vec::new();
-                self.ws();
-                if self.s.get(self.i) == Some(&b']') {
-                    self.i += 1;
-                    return Ok(Json::Arr(out));
-                }
-                loop {
-                    self.ws();
-                    out.push(self.value(depth + 1)?);
-                    self.ws();
-                    match self.s.get(self.i) {
-                        Some(b',') => self.i += 1,
-                        Some(b']') => {
-                            self.i += 1;
-                            return Ok(Json::Arr(out));
-                        }
-                        _ => return Err(self.err("expected ',' or ']'")),
-                    }
-                }
+        let k = self.string()?;
+        self.ws();
+        if self.s.get(self.i) != Some(&b':') {
+            return Err(self.err("expected ':'"));
+        }
+        self.i += 1;
+        Ok(k)
+    }
+
+    /// Parses one value. Iterative (an explicit stack of open containers), so deep input cannot
+    /// overflow the call stack.
+    fn value(&mut self) -> Result<Json> {
+        enum Open {
+            Arr(Vec<Json>),
+            /// Members, key → index (the last duplicate wins, like `JSON.parse`), pending key.
+            Obj(Vec<(String, Json)>, HashMap<String, usize>, String),
+        }
+        let mut stack: Vec<Open> = Vec::new();
+        loop {
+            // a value starts here, nested `stack.len()` levels deep
+            if stack.len() > self.max_depth {
+                return Err(self.err("nesting too deep"));
             }
-            Some(b'{') => {
-                self.i += 1;
-                let mut out: Vec<(String, Json)> = Vec::new();
-                let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                self.ws();
-                if self.s.get(self.i) == Some(&b'}') {
-                    self.i += 1;
-                    return Ok(Json::Obj(out));
-                }
-                loop {
-                    self.ws();
-                    if self.s.get(self.i) != Some(&b'"') {
-                        return Err(self.err("expected a key"));
-                    }
-                    let k = self.string()?;
-                    self.ws();
-                    if self.s.get(self.i) != Some(&b':') {
-                        return Err(self.err("expected ':'"));
-                    }
+            self.ws();
+            let mut v = match self.s.get(self.i) {
+                None => return Err(self.err("unexpected end")),
+                Some(b'n') if self.eat("null") => Json::Null,
+                Some(b't') if self.eat("true") => Json::Bool(true),
+                Some(b'f') if self.eat("false") => Json::Bool(false),
+                Some(b'"') => Json::Str(self.string()?),
+                Some(b'[') => {
                     self.i += 1;
                     self.ws();
-                    let v = self.value(depth + 1)?;
-                    if let Some(&at) = index.get(&k) {
-                        out[at].1 = v;
+                    if self.s.get(self.i) == Some(&b']') {
+                        self.i += 1;
+                        Json::Arr(Vec::new())
                     } else {
-                        index.insert(k.clone(), out.len());
-                        out.push((k, v));
-                    }
-                    self.ws();
-                    match self.s.get(self.i) {
-                        Some(b',') => self.i += 1,
-                        Some(b'}') => {
-                            self.i += 1;
-                            return Ok(Json::Obj(out));
-                        }
-                        _ => return Err(self.err("expected ',' or '}'")),
+                        stack.push(Open::Arr(Vec::new()));
+                        continue;
                     }
                 }
+                Some(b'{') => {
+                    self.i += 1;
+                    self.ws();
+                    if self.s.get(self.i) == Some(&b'}') {
+                        self.i += 1;
+                        Json::Obj(Vec::new())
+                    } else {
+                        let k = self.key()?;
+                        stack.push(Open::Obj(Vec::new(), HashMap::new(), k));
+                        continue;
+                    }
+                }
+                Some(c) if *c == b'-' || c.is_ascii_digit() => self.number()?,
+                _ => return Err(self.err("unexpected character")),
+            };
+            // attach the value to its container; close containers that end here
+            loop {
+                match stack.last_mut() {
+                    None => return Ok(v),
+                    Some(Open::Arr(items)) => {
+                        items.push(v);
+                        self.ws();
+                        match self.s.get(self.i) {
+                            Some(b',') => self.i += 1,
+                            Some(b']') => {
+                                self.i += 1;
+                                let Some(Open::Arr(items)) = stack.pop() else { unreachable!() };
+                                v = Json::Arr(items);
+                                continue;
+                            }
+                            _ => return Err(self.err("expected ',' or ']'")),
+                        }
+                    }
+                    Some(Open::Obj(members, index, key)) => {
+                        let k = std::mem::take(key);
+                        match index.get(&k) {
+                            Some(&at) => members[at].1 = v,
+                            None => {
+                                index.insert(k.clone(), members.len());
+                                members.push((k, v));
+                            }
+                        }
+                        self.ws();
+                        match self.s.get(self.i) {
+                            Some(b',') => {
+                                self.i += 1;
+                                *key = self.key()?;
+                            }
+                            Some(b'}') => {
+                                self.i += 1;
+                                let Some(Open::Obj(members, _, _)) = stack.pop() else { unreachable!() };
+                                v = Json::Obj(members);
+                                continue;
+                            }
+                            _ => return Err(self.err("expected ',' or '}'")),
+                        }
+                    }
+                }
+                break;
             }
-            Some(c) if *c == b'-' || c.is_ascii_digit() => self.number(),
-            _ => Err(self.err("unexpected character")),
         }
     }
 
@@ -253,6 +303,18 @@ impl Json {
     }
 
     /// Converts to a `serde_json::Value` (for typed deserialization of options and models).
+    /// Nesting depth (a scalar is 0); stops counting at `cap`.
+    pub fn depth(&self, cap: usize) -> usize {
+        if cap == 0 {
+            return 0;
+        }
+        match self {
+            Json::Arr(a) => 1 + a.iter().map(|v| v.depth(cap - 1)).max().unwrap_or(0),
+            Json::Obj(o) => 1 + o.iter().map(|(_, v)| v.depth(cap - 1)).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     pub fn to_serde(&self) -> SJson {
         match self {
             Json::Null => SJson::Null,
