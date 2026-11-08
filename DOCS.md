@@ -391,7 +391,7 @@ template and the data refers to blobs 1, 2, ….
 
 ```json
 {
-  "coreVersion": "0.1.0", "abiVersion": 1, "modelVersion": 1,
+  "coreVersion": "0.1.1", "abiVersion": 1, "modelVersion": 1,
   "formats": ["docx", "xlsx", "pptx"],
   "features": { "images": ["docx", "pptx"], "slideLoops": false, "hostFilters": true }
 }
