@@ -875,3 +875,35 @@ fn pptx_alternate_content_and_connectors() {
         assert_eq!((s, e), (&before[n - 3], &before[n - 2]), "copy {k}: {ids:?}");
     }
 }
+
+// Format detection: `<Default>` content types of embedded files (pptxgenjs always declares
+// `Extension="xlsx"`, PowerPoint does for charts) do not decide the format.
+#[test]
+fn detect_ignores_default_content_types_of_embedded_files() {
+    let defaults = r#"<Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/><Default Extension="docx" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/>"#;
+    let mut entries = coffee_core::zip::read(&pptx(&shape(2, "Hello {{name}}"), ""), &Default::default()).unwrap();
+    for (name, data) in entries.iter_mut() {
+        if name == "[Content_Types].xml" {
+            *data = String::from_utf8(data.clone()).unwrap().replacen("<Default ", &format!("{defaults}<Default "), 1).into_bytes();
+        }
+    }
+    let file = coffee_core::zip::write(entries.iter().map(|(n, d)| (n.as_str(), d.as_slice()))).unwrap();
+    assert_eq!(coffee_core::detect(&file, &Default::default()).unwrap(), coffee_core::DocumentFormat::Pptx);
+    let out = render(&file, r#"{"name":"Ann"}"#);
+    assert!(read_part(&out, "ppt/slides/slide1.xml").contains("Hello Ann"));
+    // the same for documents and workbooks carrying embedded files
+    for (file, format) in [
+        (docx(&p(&["x"])), coffee_core::DocumentFormat::Docx),
+        (xlsx(&[("S", "<sheetData/>")], "", &[]), coffee_core::DocumentFormat::Xlsx),
+    ] {
+        let mut entries = coffee_core::zip::read(&file, &Default::default()).unwrap();
+        for (name, data) in entries.iter_mut() {
+            if name == "[Content_Types].xml" {
+                let d = r#"<Default Extension="pptx" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation"/>"#;
+                *data = String::from_utf8(data.clone()).unwrap().replacen("<Default ", &format!("{defaults}{d}<Default "), 1).into_bytes();
+            }
+        }
+        let file = coffee_core::zip::write(entries.iter().map(|(n, d)| (n.as_str(), d.as_slice()))).unwrap();
+        assert_eq!(coffee_core::detect(&file, &Default::default()).unwrap(), format);
+    }
+}

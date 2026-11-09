@@ -7,6 +7,7 @@ pub mod xlsx;
 use crate::error::{Error, ErrorCode, Result};
 use crate::opc::{Package, CONTENT_TYPES};
 use crate::template::engine::FormatHooks;
+use crate::xml::tokenizer::{find_tags, raw_attr};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -37,17 +38,59 @@ impl DocumentFormat {
         }
     }
 
+    /// Detects the format from the main document part: its content type (`<Override>` in
+    /// `[Content_Types].xml`), then its path. `<Default>` entries are not used: a presentation
+    /// with charts declares `Extension="xlsx"` as a spreadsheet, and one with an embedded Word
+    /// document declares `docx`.
     pub fn detect(pkg: &Package) -> Result<DocumentFormat> {
-        let main = pkg.main_document_path().unwrap_or_default();
         let ct = pkg.get_text(CONTENT_TYPES).unwrap_or_default();
-        if main.starts_with("word/") || ct.contains("wordprocessingml.document") {
-            return Ok(DocumentFormat::Docx);
+        let overrides: Vec<(String, String)> = find_tags(&ct, "<Override")
+            .filter_map(|(s, e)| {
+                let tag = &ct[s..e];
+                let part = raw_attr(tag, "PartName")?.trim_start_matches('/').to_string();
+                Some((part, raw_attr(tag, "ContentType")?.to_string()))
+            })
+            .collect();
+        let by_type = |t: &str| {
+            let t = t.split(';').next().unwrap_or(t).trim();
+            if t.starts_with("application/vnd.openxmlformats-officedocument.wordprocessingml.") || t.starts_with("application/vnd.ms-word.")
+            {
+                Some(DocumentFormat::Docx)
+            } else if t.starts_with("application/vnd.openxmlformats-officedocument.spreadsheetml.")
+                || t.starts_with("application/vnd.ms-excel.")
+            {
+                Some(DocumentFormat::Xlsx)
+            } else if t.starts_with("application/vnd.openxmlformats-officedocument.presentationml.")
+                || t.starts_with("application/vnd.ms-powerpoint.")
+            {
+                Some(DocumentFormat::Pptx)
+            } else {
+                None
+            }
+        };
+        let main = pkg.main_document_path().unwrap_or_default();
+        if !main.is_empty() {
+            if let Some(f) = overrides.iter().find(|(p, _)| p.eq_ignore_ascii_case(&main)).and_then(|(_, t)| by_type(t)) {
+                return Ok(f);
+            }
+            for (prefix, f) in [("word/", DocumentFormat::Docx), ("xl/", DocumentFormat::Xlsx), ("ppt/", DocumentFormat::Pptx)] {
+                if main.starts_with(prefix) {
+                    return Ok(f);
+                }
+            }
         }
-        if main.starts_with("xl/") || ct.contains("spreadsheetml.sheet") {
-            return Ok(DocumentFormat::Xlsx);
-        }
-        if main.starts_with("ppt/") || ct.contains("presentationml.presentation") {
-            return Ok(DocumentFormat::Pptx);
+        // no usable main part: the main document content types among the overrides
+        for (suffix, f) in [
+            ("wordprocessingml.document.main+xml", DocumentFormat::Docx),
+            ("wordprocessingml.template.main+xml", DocumentFormat::Docx),
+            ("spreadsheetml.sheet.main+xml", DocumentFormat::Xlsx),
+            ("spreadsheetml.template.main+xml", DocumentFormat::Xlsx),
+            ("presentationml.presentation.main+xml", DocumentFormat::Pptx),
+            ("presentationml.template.main+xml", DocumentFormat::Pptx),
+        ] {
+            if overrides.iter().any(|(_, t)| t.ends_with(suffix)) {
+                return Ok(f);
+            }
         }
         Err(Error::new(ErrorCode::UnsupportedFormat, "Unsupported document: expected a .docx, .xlsx or .pptx file"))
     }
